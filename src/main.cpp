@@ -4,6 +4,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <Update.h>
+#include <Preferences.h>
 
 // ==========================================
 // PINS & CALIBRATION (CLASSIC ESP32)
@@ -18,14 +19,17 @@ const float PWR_CAL_FACTOR = 13.85;
 const float REV_CAL_FACTOR = 1.35;
 
 // ==========================================
-// WIFI SETTINGS
+// WIFI SETTINGS & NVS STORAGE
 // ==========================================
-const char* WIFI_SSID = "Kuitunen";
-const char* WIFI_PASS = "12345678";
+// Default fallback credentials if not yet configured via Web UI (/wifi)
+const char* DEFAULT_WIFI_SSID = "Kuitunen";
+const char* DEFAULT_WIFI_PASS = "12345678";
 
-const char* AP_SSID = "SWR-Meter-ESP32";
+// Standalone SoftAP for initial setup or portable / Field Day use
+const char* AP_SSID = "SWR-Meter-AP";
 const char* AP_PASS = "12345678";
 
+Preferences preferences;
 WebServer server(2222);
 
 // Telemetry variables
@@ -293,7 +297,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div class="title-box">
         <h1>SWR & POWER MONITOR</h1>
       </div>
-      <div style="display: flex; gap: 0.75rem; align-items: center;">
+      <div style="display: flex; gap: 0.6rem; align-items: center;">
+        <a href="/wifi" style="text-decoration: none; color: #62728d; background: #182030; border: 1px solid #243048; border-radius: 6px; padding: 0.35rem 0.75rem; font-size: 0.85rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; display: flex; align-items: center; gap: 4px; transition: all 0.2s;" onmouseover="this.style.color='#fff'; this.style.borderColor='#00ff88'" onmouseout="this.style.color='#62728d'; this.style.borderColor='#243048'">⚙️ WIFI</a>
         <div id="wifi-badge" class="wifi-badge">📶 <span id="rssi-val">--</span> dBm</div>
         <div id="tx-badge" class="status-badge rx">RX</div>
       </div>
@@ -301,7 +306,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     <!-- ALERT BANNER -->
     <div id="alert-banner" class="alert-banner">
-      ⚠️ <span id="alert-msg">VAROITUS</span>
+      ⚠️ <span id="alert-msg">WARNING</span>
     </div>
 
     <div class="grid">
@@ -547,9 +552,181 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+const char WIFI_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WiFi Setup - SWR & Power Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #090d14;
+      --card-bg: #121824;
+      --card-border: #1a2334;
+      --accent: #00ff88;
+      --text-main: #f0f4fc;
+      --text-muted: #62728d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text-main);
+      font-family: 'Rajdhani', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 440px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    h2 {
+      font-size: 1.5rem;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-bottom: 0.5rem;
+      color: #fff;
+    }
+    p {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      margin-bottom: 1.5rem;
+      line-height: 1.4;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 0.4rem;
+    }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 0.75rem 1rem;
+      background: #090d14;
+      border: 1px solid #243048;
+      border-radius: 8px;
+      color: #fff;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1rem;
+      margin-bottom: 1.25rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus {
+      border-color: var(--accent);
+    }
+    .btn {
+      width: 100%;
+      padding: 0.85rem;
+      background: #00ff88;
+      color: #090d14;
+      font-family: 'Rajdhani', sans-serif;
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: 1px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: background 0.2s, transform 0.1s;
+    }
+    .btn:hover {
+      background: #00e077;
+    }
+    .btn:active {
+      transform: scale(0.98);
+    }
+    .back-link {
+      display: block;
+      text-align: center;
+      margin-top: 1.25rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 600;
+      transition: color 0.2s;
+    }
+    .back-link:hover {
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>⚙️ WiFi Configuration</h2>
+    <p>Configure your local network SSID and password. Settings are permanently stored in ESP32 flash memory (NVS).</p>
+    <form action="/save_wifi" method="POST">
+      <label for="ssid">WiFi Network Name (SSID)</label>
+      <input type="text" id="ssid" name="ssid" required placeholder="Enter WiFi SSID" value="{CURRENT_SSID}">
+      
+      <label for="pass">WiFi Password</label>
+      <input type="password" id="pass" name="pass" placeholder="Enter WiFi Password">
+      
+      <button type="submit" class="btn">💾 Save & Reboot</button>
+    </form>
+    <a href="/" class="back-link">← Return to Monitor</a>
+  </div>
+</body>
+</html>
+)rawliteral";
+
 // ==========================================
 // REST ROUTES
 // ==========================================
+void handleWifi() {
+  preferences.begin("swr_cfg", true);
+  String curSsid = preferences.getString("ssid", DEFAULT_WIFI_SSID);
+  preferences.end();
+
+  String html = FPSTR(WIFI_HTML);
+  html.replace("{CURRENT_SSID}", curSsid);
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/html", html);
+}
+
+void handleSaveWifi() {
+  if (server.hasArg("ssid")) {
+    String newSsid = server.arg("ssid");
+    String newPass = server.arg("pass");
+    newSsid.trim();
+    newPass.trim();
+
+    preferences.begin("swr_cfg", false);
+    preferences.putString("ssid", newSsid);
+    preferences.putString("pass", newPass);
+    preferences.end();
+
+    String resp = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+                  "<title>Saved</title><style>body{background:#090d14;color:#f0f4fc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}"
+                  ".box{background:#121824;border:1px solid #1a2334;border-radius:12px;padding:2rem;text-align:center;max-width:420px;box-shadow:0 10px 30px rgba(0,0,0,0.5);}"
+                  "h2{color:#00ff88;margin-bottom:0.75rem;}p{color:#8fa0b5;line-height:1.5;}</style></head>"
+                  "<body><div class='box'><h2>✅ WiFi Settings Saved!</h2>"
+                  "<p>Connecting to <b>" + newSsid + "</b>.<br>Device is rebooting in 2 seconds...</p>"
+                  "<p style='font-size:0.85rem;color:#62728d;margin-top:1.5rem;'>Reconnecting to <b>http://swrmeter.local:2222</b> or your router's assigned IP.</p></div>"
+                  "<script>setTimeout(function(){ window.location.href = 'http://swrmeter.local:2222'; }, 4000);</script></body></html>";
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", resp);
+    delay(1500);
+    ESP.restart();
+  } else {
+    server.send(400, "text/plain", "Missing SSID parameter");
+  }
+}
+
 void handleRoot() {
   server.sendHeader("Connection", "close");
   server.send_P(200, "text/html", INDEX_HTML);
@@ -742,20 +919,34 @@ void setup() {
     0 // Core 0
   );
 
+  // Load WiFi settings from Flash (NVS)
+  preferences.begin("swr_cfg", false);
+  String activeSsid = preferences.getString("ssid", DEFAULT_WIFI_SSID);
+  String activePass = preferences.getString("pass", DEFAULT_WIFI_PASS);
+  preferences.end();
+
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm); // Wi-Fi lähetysteho täysille (maksimi +19.5 dBm)
+  WiFi.setTxPower(WIFI_POWER_19_5dBm); // Maximum Wi-Fi output (+19.5 dBm)
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) {
-    delay(300);
-    retries++;
-  }
-
+  // Always enable SoftAP so the device is accessible anywhere (Field Day / initial setup)
   WiFi.softAP(AP_SSID, AP_PASS);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm); // Varmistetaan täysi lähetysteho (+19.5 dBm)
+
+  if (activeSsid.length() > 0 && activeSsid != "YOUR_WIFI_SSID") {
+    Serial.printf("Connecting to WiFi: %s\n", activeSsid.c_str());
+    WiFi.begin(activeSsid.c_str(), activePass.c_str());
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 25) {
+      delay(200);
+      retries++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("WiFi Connected! IP: ");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("WiFi connection failed. Access Point active: SWR-Meter-AP (192.168.4.1:2222)");
+    }
+  }
 
   if (MDNS.begin("swrmeter")) {
     MDNS.addService("http", "tcp", 2222);
@@ -763,6 +954,8 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/data", handleData);
+  server.on("/wifi", handleWifi);
+  server.on("/save_wifi", HTTP_POST, handleSaveWifi);
 
   // Web OTA päivitys suoraan selaimesta
   server.on("/update", HTTP_POST, []() {

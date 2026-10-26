@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 TARGETS = [
     ("192.168.1.159", 2222),
     ("swrmeter.local", 2222),
+    ("192.168.4.1", 2222),
     ("192.168.1.170", 2222)
 ]
 

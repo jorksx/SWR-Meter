@@ -1,146 +1,171 @@
 # ESP32 HF SWR & Power Meter (1.8 – 50 MHz)
 
-Reaaliaikainen, langaton ja erittäin tarkka HF-alueen (160m – 6m) SWR- ja tehomittari radioamatöörikäyttöön. 
+A high-speed, wireless, and highly accurate HF (160m – 6m) amateur radio SWR and RF power meter.
 
-Mittaus perustuu **Stockton / Tandem-Match** -suuntakytkimeen ja **ESP32**-mikrokontrolleriin. Laitteessa on sisäänrakennettu nopea Web-käyttöliittymä (portti 2222) sekä kustomoitu, kehyksetön työpöytäsovellus Windowsille viidellä eri teemalla (ml. aito mekaanisesti vaimennettu Cross-Needle -ristiviisarimittari).
+Powered by a **Stockton / Tandem-Match** directional coupler and an **ESP32** microcontroller. Features a responsive standalone Web UI (port 2222) and a custom frameless desktop application for Windows with 5 auto-scaling themes — including an authentic mechanically-damped **Cross-Needle** meter.
 
 ---
 
-## ⚠️ ERITTÄIN TÄRKEÄÄ: 10 kΩ PURKUVASTUKSET (HUOMIOI KIINAN KITIT!)
+## ⚠️ CRITICAL WARNING: 10 kΩ BLEEDER RESISTORS (CHINESE KITS CAVEAT!)
 
 > [!CAUTION]
-> ### 🔴 KIINAN TANDEM MATCH / STOCKTON -KITEISSÄ ON KRIITTINEN PUUTE!
-> Kiinasta (AliExpress, eBay, Banggood) tilattavissa edullisissa Stockton/Tandem Match DIY-kytkinpaketeissa **EI TULE MUKANA** ilmaisindiodeiden kuorma-/purkuvastuksia (bleeder / pulldown resistors), tai ne puuttuvat piirilevyltä kokonaan!
+> ### 🔴 CHINESE TANDEM MATCH / STOCKTON KITS HAVE A FATAL OMISSION!
+> Cheap Stockton / Tandem-Match DIY directional coupler kits from China (AliExpress, eBay, Banggood) **DO NOT INCLUDE** bleeder/pulldown load resistors on the detector outputs, or they are omitted from the PCB layout entirely!
 >
-> **Miksi tämä on kriittistä?**
-> Suuntakytkimen ilmaisindiodit tasasuuntaavat RF-jännitteen suodatinkonkkien yli tasajännitteeksi (DC). ESP32:n analogiatulojen (GPIO 34 & 35) tuloimpedanssi on erittäin suuri (>10 MΩ). **Ilman kuormavastuksia kondensaattorit eivät pääse koskaan purkautumaan maihin!**
+> **Why is this critical?**
+> The directional coupler's RF diodes rectify RF voltage into DC pulses, charging the filter capacitors. The ESP32's ADC inputs (GPIO 34 and GPIO 35) have an extremely high input impedance (>10 MΩ). **Without a DC path to ground, the capacitors NEVER discharge!**
 >
-> **Mitä tapahtuu, jos unohdat 10 kΩ vastukset:**
-> 1. Kondensaattorit latautuvat ensimmäisellä lähetteellä huippujännitteeseen ja **jäävät jumiin** – mittari näyttää jatkuvaa tehoa ja SWR-lukemaa vielä lähetyksen päätyttyäkin!
-> 2. Tulot alkavat kellua ja poimivat 50 Hz verkkohurinaa ja staattista häiriötä, jolloin RX-tilassa näkyy "haamutehoja".
-> 3. SWR-laskenta antaa täysin vääriä lukemia.
+> **What happens if you omit the 10 kΩ resistors:**
+> 1. The capacitors charge to peak voltage on your first transmission and **stay permanently charged** — the meter remains frozen showing power and high SWR even after you release the PTT and return to RX!
+> 2. The high-impedance ADC inputs float, picking up 50/60 Hz mains hum and static electricity, causing "phantom power" readings in RX mode.
+> 3. SWR calculations become completely erroneous and wildly unstable.
 >
-> ### ✅ RATKAISU:
-> Kytke kaksi tavallista **10 kΩ vastusta** (1/4 W tai SMD):
-> - **1 kpl 10 kΩ vastus FWD-lähdön ja MAAN (GND) väliin**
-> - **1 kpl 10 kΩ vastus REV-lähdön ja MAAN (GND) väliin**
+> ### ✅ SOLUTION:
+> You **MUST** install two standard **10 kΩ resistors** (1/4 W through-hole or SMD):
+> - **1x 10 kΩ resistor between FWD output and GROUND (GND)**
+> - **1x 10 kΩ resistor between REV output and GROUND (GND)**
 >
-> *(Voit juottaa vastukset suoraan kytkinpiirilevyn FWD/REV-lähtöjen ja maapinnan väliin tai ESP32:n GPIO 34/35 -pinnien ja GND:n väliin).*
+> *(You can solder these resistors directly between the FWD/REV terminal pads and the ground plane on the coupler PCB, or across ESP32 pins 34/35 and GND).*
 
 ---
 
-## 🔌 Kytkentäkaavio (Wiring)
+## 🔌 Hardware Wiring & Pinout
 
 ```
- [ Radio / TX ] ---> [ Stockton / Tandem Coupler ] ---> [ Antenni / Keinokuorma ]
-                               |           |
-                              FWD         REV
-                               |           |
-                               +--[10kΩ]   +--[10kΩ]   (PURKUVASTUKSET MAIHIN!)
-                               |    |      |    |
-                              ( )  GND    ( )  GND
-                               |           |
-                               v           v
-                          ESP32 GPIO 34  ESP32 GPIO 35
-                          (PIN_FWD)      (PIN_REV)
+ [ Transceiver / Rig ] ---> [ Stockton / Tandem Coupler ] ---> [ Antenna / Dummy Load ]
+                                   |           |
+                                  FWD         REV
+                                   |           |
+                                   +--[10kΩ]   +--[10kΩ]   (PULLDOWN BLEEDERS TO GND!)
+                                   |    |      |    |
+                                  ( )  GND    ( )  GND
+                                   |           |
+                                   v           v
+                              ESP32 GPIO 34  ESP32 GPIO 35
+                              (PIN_FWD)      (PIN_REV)
 
- Yhteinen maa: Kytkimen GND  ===========>  ESP32 GND
- Virransyöttö: ESP32 Micro-USB (5V) tai VIN-pinni
+ Common Ground: Coupler GND  ===============>  ESP32 GND
+ Power Supply:  ESP32 Micro-USB (5V) or VIN Pin
 ```
 
-### Pinnijärjestys (ESP32):
-| ESP32 Pinni | Signaali | Huomiot |
+### Pin Connection Table:
+| ESP32 Pin | Signal | Notes |
 |---|---|---|
-| **GPIO 34** | `FWD` (Etenevä jännite) | + 10 kΩ vastus maihin (GND) |
-| **GPIO 35** | `REV` (Heijastunut jännite) | + 10 kΩ vastus maihin (GND) |
-| **GND** | Maa | Kytketään suuntakytkimen maahan |
-| **5V / USB** | Käyttöjännite | 5V virransyöttö |
+| **GPIO 34** | `FWD` (Forward Voltage) | + 10 kΩ pulldown resistor to GND |
+| **GPIO 35** | `REV` (Reflected Voltage) | + 10 kΩ pulldown resistor to GND |
+| **GND** | Ground | Connect to directional coupler ground plane |
+| **5V / USB** | VCC | 5V DC power input |
 
 ---
 
-## 🎯 Kalibrointiohje (Vaihe vaiheelta)
+## 📶 WiFi Configuration (No Hardcoded WiFi Required!)
 
-Kalibrointi tehdään kahdessa helpossa vaiheessa. Tarvitset **radion**, **50 Ω keinokuorman (Dummy Load)** ja luotettavan tehomittarin (tai radion oman tehonäytön).
+You do not need to hardcode your WiFi password in the firmware. The ESP32 stores WiFi credentials permanently in Flash memory (**NVS Preferences**).
 
-### Vaihe 1: Etenevän tehon kalibrointi (`PWR_CAL_FACTOR`)
-1. Kytke: **Radio ➔ Suuntakytkimen TX-liitin ➔ Suuntakytkimen ANT-liitin ➔ 50 Ω Keinokuorma**.
-2. Lähetä jatkuvaa kantoaaltoa (CW, FM tai RTTY) tunnetulla teholla, esim. **100 W** (tai 50 W).
-3. Katso työpöytäohjelman alareunasta tai Web UI:sta havaittu jännite **`fwd_v`** (esim. `2.68 V`).
-4. Laske kalibrointikerroin kaavalla:
-   $$\text{PWR\_CAL\_FACTOR} = \frac{\text{Todellinen teho (W)}}{(V_{\text{fwd}})^2}$$
-   *Esimerkki:* Jos todellinen teho on 100 W ja $V_{\text{fwd}} = 2.68\text{ V}$:
+### Option 1: Web Interface Configuration (Easiest)
+1. Turn on the ESP32.
+2. If it cannot connect to a known network, it automatically broadcasts its own SoftAP:
+   - **SSID:** `SWR-Meter-AP`
+   - **Password:** `12345678`
+   - **Setup URL:** `http://192.168.4.1:2222` (or click the **⚙️ WIFI** button in the header)
+3. Enter your home/shack WiFi network name (SSID) and Password.
+4. Click **💾 Save & Reboot**.
+5. The device saves the credentials to NVS, restarts, and connects to your home network. You can now access it at `http://swrmeter.local:2222` or its assigned local IP.
+
+### Option 2: Changing WiFi Anytime
+Even when connected to your home network, you can click the **⚙️ WIFI** button in the web UI header (or visit `http://<ip>:2222/wifi`) to update your network settings on the fly.
+
+### Option 3: Default Credentials in Source (Optional)
+If you prefer hardcoding default fallback credentials, edit lines 25–26 in [src/main.cpp](file:///src/main.cpp):
+```cpp
+const char* DEFAULT_WIFI_SSID = "YOUR_WIFI_SSID";
+const char* DEFAULT_WIFI_PASS = "YOUR_WIFI_PASSWORD";
+```
+
+---
+
+## 🎯 Step-by-Step Calibration Guide
+
+Calibration takes only a couple of minutes. You need your **transceiver**, a trusted **50 Ω Dummy Load**, and an accurate reference power meter (or your transceiver's internal calibrated wattmeter).
+
+### Step 1: Forward Power Calibration (`PWR_CAL_FACTOR`)
+1. Connect: **Rig ➔ Coupler TX port ➔ Coupler ANT port ➔ 50 Ω Dummy Load**.
+2. Transmit a steady carrier (CW, FM, or RTTY) at a known power level, e.g. **100 W** (or 50 W).
+3. Check the detected voltage **`fwd_v`** displayed in the desktop app footer or Web UI (e.g. `2.68 V`).
+4. Calculate your calibration constant using the formula:
+   $$\text{PWR\_CAL\_FACTOR} = \frac{\text{Actual Power (W)}}{(V_{\text{fwd}})^2}$$
+   *Example:* If actual power is 100 W and $V_{\text{fwd}} = 2.68\text{ V}$:
    $$\text{PWR\_CAL\_FACTOR} = \frac{100}{2.68 \times 2.68} = \frac{100}{7.1824} \approx 13.92$$
-5. Avaa [src/main.cpp](file:///src/main.cpp) ja päivitä rivi 15:
+5. Update line 15 in [src/main.cpp](file:///src/main.cpp):
    ```cpp
-   const float PWR_CAL_FACTOR = 13.85; // Aseta oma laskettu arvosi tähän
+   const float PWR_CAL_FACTOR = 13.85; // Set your calculated value here
    ```
 
-### Vaihe 2: Heijastuneen haaran tasapainotus (`REV_CAL_FACTOR`)
-Diodien ja ferriittimuuntajien pienet toleranssierot korjataan tasapainottamalla kanavat:
-1. **Käännä suuntakytkimen RF-kaapelit toisinpäin:**
-   - Liitä Radio kytkimen **ANT**-liittimeen.
-   - Liitä 50 Ω keinokuorma kytkimen **TX**-liittimeen.
-2. Lähetä matalalla teholla (esim. **10 W** tai **20 W**).
-3. Nyt teho kulkee suuntakytkimen läpi väärään suuntaan, jolloin teho näkyykin heijastuneena jännitteenä (`rev_v`).
-4. Tarkista ohjelmasta `fwd_v` ja `rev_v`. Säädä kerrointa `REV_CAL_FACTOR` tiedostossa [src/main.cpp](file:///src/main.cpp) (rivi 18) siten, että `rev_v` vastaa tarkalleen `fwd_v`:tä (eli mitattu heijastusteho vastaa todellista lähetystehoa):
+### Step 2: Reverse Channel Balance (`REV_CAL_FACTOR`)
+Due to minor component tolerances in diodes and ferrite binocular transformers, the reverse channel sensitivity is balanced against the forward channel:
+1. **Reverse the RF coaxial cables on the coupler:**
+   - Connect your Radio to the coupler's **ANT** port.
+   - Connect the 50 Ω Dummy Load to the coupler's **TX** port.
+2. Transmit at low power (e.g. **10 W** or **20 W**).
+3. The forward power now flows through the reverse detection winding, appearing as reflected voltage (`rev_v`).
+4. Observe `fwd_v` and `rev_v` in the monitor. Adjust `REV_CAL_FACTOR` on line 18 in [src/main.cpp](file:///src/main.cpp) so that `rev_v` exactly matches `fwd_v` (i.e., measured reflected power equals forward power):
    ```cpp
-   const float REV_CAL_FACTOR = 1.35; // Säädä tarvittaessa
+   const float REV_CAL_FACTOR = 1.35; // Adjust as needed for symmetry
    ```
-5. **Käännä RF-kaapelit takaisin oikein päin:** (Radio ➔ TX, ANT ➔ Antenni / Keinokuorma).
+5. **Restore the RF cables to normal:** (Radio ➔ TX, ANT ➔ Antenna / Dummy Load).
 
-### Vaihe 3: SWR-mittauksen varmistus
-- Lähetä 50 Ω keinokuormaan: SWR-lukeman tulee olla **1.00 : 1** (tai enintään 1.05 : 1) ja heijastuneen tehon `0.00 W`.
-- Jos kytket keinokuorman tilalle esim. 100 Ω kuorman tai 25 Ω kuorman (kaksi 50 Ω keinokuormaa rinnakkain), mittarin tulee näyttää tarkasti SWR **2.00 : 1**.
+### Step 3: SWR Verification
+- Transmit into your 50 Ω dummy load: SWR should read **1.00 : 1** (to 1.05 : 1) and reflected power `0.00 W`.
+- (Optional) If you connect a 100 Ω load or a 25 Ω load (two 50 Ω loads in parallel), the meter should read **2.00 : 1** SWR.
 
 ---
 
-## 💻 Ohjelmistot ja käyttöliittymät
+## 💻 Software & User Interfaces
 
 ### 1. ESP32 Firmware ([src/main.cpp](file:///src/main.cpp))
-- **200 Hz FreeRTOS-mittaussilmukka** Core 0:ssa: salamannopea analogianäytteistys ja Transient Blanking (estää SWR-piikit lähetyksen kytkentähetkellä).
-- **PEP & True AVG:** Huipputehon pito (Peak Hold 1.5s) sekä ballistinen puhetehon keskiarvosuodatus (VU-mittarityyli SSB:lle).
-- **Sisäänrakennettu Web Server (Portti 2222):** Responsiivinen mobiili- ja selainkäyttöliittymä liukuväreillä ja animoiduilla mittareilla (`http://swrmeter.local:2222` tai suora IP).
-- **Langaton päivitys (Web OTA):** Firmwaren voi päivittää suoraan selaimella osoitteessa `http://<ip>:2222/update` ilman USB-kaapelia.
+- **200 Hz FreeRTOS Sampling Task** on Core 0: ultra-fast ADC sampling with key-up transient blanking to prevent false SWR spikes when keying up.
+- **PEP & True AVG Ballistics:** Fast Peak Hold (1.5s decay) and voice-power averaging (VU meter ballistics for SSB).
+- **Built-in Web Server (Port 2222):** Mobile-friendly, dark-themed responsive dashboard with dynamic gradient bars and RSSI meter (`http://swrmeter.local:2222`).
+- **Web OTA Updates:** Flash new firmware wirelessly from your browser via `http://<ip>:2222/update`.
 
-### 2. Windows Työpöytäsovellus ([swr_monitor.py](file:///swr_monitor.py))
-Kehyksetön tyylikäs Windows-työpöytäikkuna, jota voi siirtää raahaamalla ja joka pysyy haluttaessa aina päällimmäisenä (`PIN 📌`).
+### 2. Windows Desktop Monitor ([swr_monitor.py](file:///swr_monitor.py))
+A modern, borderless desktop GUI window featuring custom draggable header, close button, and always-on-top toggle (`PIN 📌`).
 
-**5 Vaihdettavaa teemaa (ikkuna skaalautuu automaattisesti ilman hukkatilaa):**
-1. **MODERN:** Liukuvärikortit, PEP- ja AVG-tehopalkit, reaaliaikainen SWR-väripalkki ja tarkat telemetrianumerot.
-2. **CROSS-NEEDLE:** Aito analoginen Daiwa/Nissei -tyylinen ristiviisarimittari tummalla instrumenttitaululla, pehmennetyllä mekaanisella viisari-inertialla ja alakeskuksen punaisilla SWR-viuhkoilla.
-3. **MATRIX:** Cyberpunk-tyylinen vihreä ASCII-terminaali, palkit ja reaaliaikainen RF-kantoaallon oskillogrammi.
-4. **RETRO RIG:** Kaksi suurta pyöreää analogista mittarikelloa metallireunuksin ja lämpimällä oranssilla valaistuksella.
-5. **CLEAN OLED:** Ultraminimalistinen, virtaviivainen ja huippukontrastinen HUD-näyttö.
+**5 Dynamically Auto-Scaling Themes (Zero Wasted Space):**
+1. **MODERN:** Dual gradient power cards, PEP & AVG bars, live color-shifting SWR meter, and detailed telemetry footer.
+2. **CROSS-NEEDLE:** Authentic Daiwa/Nissei-style crossed meter with dark slate instrument faceplate, low-pass damped needle inertia (zero jitter), and center radial SWR fan lines.
+3. **MATRIX:** Cyberpunk green terminal display with live ASCII power/SWR bars and a real-time RF carrier oscillogram.
+4. **RETRO RIG:** Dual illuminated amber round dial gauges with authentic metallic bezels.
+5. **CLEAN OLED:** Ultra-compact, minimalist high-contrast HUD display.
 
-**Automaattinen anomaliavalvonta (visuaaliset hälytykset):**
-- Äkilliset SWR-hypyt kesken lähetyksen.
-- Korkea SWR (>3.0:1) -varoitus.
-- Käänteisen jännitteen poikkeama (`REV > FWD`).
-- ESP32 ADC-yliohjaus / leikkausvaroitus (`> 3.05 V`).
-- Hälytyksen sattuessa ikkuna laajenee automaattisesti ja vilkuttaa huomioväriä ilman ärsyttäviä piippausääniä.
+**Intelligent Real-Time Anomaly Detection:**
+- High SWR alert (>3.0:1).
+- Sudden mid-transmission SWR jumps.
+- Reverse voltage anomalies (`REV > FWD`).
+- ESP32 ADC clipping warning (`> 3.05 V`).
+- Window expands dynamically during alerts to display flashing warning banners without obstructing meter readouts.
 
 ---
 
-## 🚀 Asennus ja käyttöönotto
+## 🚀 Quick Start Guide
 
-### 1. Firmwaren flashaus ESP32:lle
-Voit kääntää ja asentaa firmwaren suoraan [PlatformIO](https://platformio.org/):lla:
+### 1. Build & Upload Firmware to ESP32
+Using [PlatformIO](https://platformio.org/):
 ```bash
 pio run --target upload
 ```
-*(Muokkaa tarvittaessa `WIFI_SSID` ja `WIFI_PASS` tiedostosta `src/main.cpp`).*
 
-### 2. Työpöytäsovelluksen käynnistys
-Varmista, että tietokoneessasi on Python 3 ja asenna Pillow:
+### 2. Launch the Desktop Client
+Ensure Python 3 is installed with Pillow:
 ```bash
 pip install pillow
 ```
-Käynnistä mittari kaksoisnapsauttamalla tiedostoa:
+Launch by double-clicking:
 **`Kaynnista_SWR_Mittari.bat`**
 
-Ohjelma etsii mittarin automaattisesti verkosta ja muistaa viimeksi käyttämäsi teeman sekä ikkunan sijainnin ruudulla!
+The app automatically searches for the meter via direct IP, mDNS (`swrmeter.local`), and SoftAP (`192.168.4.1`), and remembers your window position and theme!
 
 ---
 
-## 📄 Lisenssi
-MIT License – Vapaasti käytettävissä ja muokattavissa amatööriradiotoimintaan. OH-amatööriterveisin! 73!
+## 📄 License
+MIT License – Free to use, modify, and distribute for all amateur radio enthusiasts. 73!
