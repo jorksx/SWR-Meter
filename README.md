@@ -29,7 +29,13 @@ Powered by a **Stockton / Tandem-Match** directional coupler and an **ESP32** mi
 
 ---
 
-## 🔌 Hardware Wiring & Pinout
+## 🔌 Hardware Wiring & Directional Coupler
+
+<p align="center">
+  <img src="images/swrbridge.png" alt="Stockton / Tandem-Match Directional Coupler Bridge" width="460">
+  <br>
+  <em>Stockton / Tandem-Match RF bridge board. Notice the two trimmer potentiometers for FWD / REV calibration and the detector outputs where the 10 kΩ pulldown resistors must be installed.</em>
+</p>
 
 ```
  [ Transceiver / Rig ] ---> [ Stockton / Tandem Coupler ] ---> [ Antenna / Dummy Load ]
@@ -173,6 +179,14 @@ const char* DEFAULT_WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
 ### 2. Windows Desktop Monitor ([swr_monitor.py](file:///swr_monitor.py))
 A modern, borderless desktop GUI window featuring custom draggable header, close button, and always-on-top toggle (`PIN 📌`).
+
+### Desktop Theme Gallery
+
+| Modern Theme | Retro Rig Theme |
+|:---:|:---:|
+| <img src="images/modern.png" alt="Modern Theme" width="440"> | <img src="images/retro.png" alt="Retro Rig Theme" width="440"> |
+| **Matrix Cyberpunk Terminal** | **Clean OLED HUD** |
+| <img src="images/matrix.png" alt="Matrix Cyberpunk Terminal Theme" width="440"> | <img src="images/oled.png" alt="Clean OLED HUD Theme" width="440"> |
 
 **5 Dynamically Auto-Scaling Themes (Zero Wasted Space):**
 1. **MODERN:** Dual gradient power cards, PEP & AVG bars, live color-shifting SWR meter, and detailed telemetry footer.
