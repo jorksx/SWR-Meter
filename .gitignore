@@ -1,0 +1,21 @@
+# PlatformIO build output
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python cache & settings
+__pycache__/
+*.py[cod]
+*$py.class
+swr_settings.json
+
+# Local temp logs
+live_tx_log.txt
+*.log
+
+# Editor & OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
