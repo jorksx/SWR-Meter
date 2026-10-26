@@ -58,6 +58,85 @@ Powered by a **Stockton / Tandem-Match** directional coupler and an **ESP32** mi
 
 ---
 
+## 🎯 Safe Calibration Guide (Multimeter / DMM Method)
+
+> [!WARNING]
+> ### ⚡ DANGER: DO NOT CONNECT FWD / REV TO ESP32 PINS DURING INITIAL CALIBRATION!
+> The trimmer potentiometers (trimpots) on Stockton / Tandem match couplers can output **7 V to 10 V+ DC** at 100 W if turned all the way up!
+> 
+> The ESP32's ADC inputs **tolerate a maximum of 3.3 V** (absolute maximum 3.6 V). Connecting an untrimmed coupler directly to the ESP32 can **instantly destroy (fry) your ESP32 ADC pins!**
+>
+> **Always adjust the trimpots with a Digital Multimeter (DMM) FIRST before connecting signal wires to the ESP32.**
+
+### Calibration Prerequisites:
+- Your **transceiver** (capable of 100 W CW / FM / RTTY steady carrier).
+- A trusted **50 Ω Dummy Load** rated for 100 W.
+- A **Digital Multimeter (DMM)** set to DC Volts (20V range).
+- The two **10 kΩ pulldown resistors** installed between FWD & GND, and REV & GND.
+
+---
+
+### Step 1: Adjust FWD Trimpot to 2.50 V with Multimeter
+1. **Leave ESP32 pins GPIO 34 (FWD) and GPIO 35 (REV) disconnected!** (Keep coupler GND connected to common ground).
+2. Connect Multimeter probes:
+   - **Red (+) probe** ➔ Coupler **FWD** output pin.
+   - **Black (-) probe** ➔ Coupler **GND**.
+3. RF Setup: **Transceiver ➔ Coupler TX port ➔ Coupler ANT port ➔ 50 Ω Dummy Load**.
+4. Key your transceiver with a steady carrier at **100 W**.
+5. Turn the **FWD trimmer potentiometer** until the multimeter reads exactly **2.50 V**.
+6. Release PTT.
+
+---
+
+### Step 2: Adjust REV Trimpot to 2.50 V (Symmetry Balance)
+1. **Reverse the RF coaxial cables on the coupler:**
+   - **Transceiver ➔ Coupler ANT port ➔ Coupler TX port ➔ 50 Ω Dummy Load**.
+2. Move the Multimeter probes:
+   - **Red (+) probe** ➔ Coupler **REV** output pin.
+   - **Black (-) probe** ➔ Coupler **GND**.
+3. Key your transceiver with a steady carrier at **100 W**. (Because RF cables are reversed, forward power flows through the reflected detector).
+4. Turn the **REV trimmer potentiometer** until the multimeter reads the exact same voltage: **2.50 V**.
+5. Release PTT.
+6. **Restore RF cables to normal:** **Transceiver ➔ Coupler TX port ➔ Coupler ANT port ➔ Antenna / Dummy load**.
+
+---
+
+### Step 3: Connect to ESP32
+Both channels are now calibrated to equal sensitivity and capped at a completely safe voltage level (max 2.50 V at 100 W, safely below the ESP32's 3.1 V ADC ceiling):
+- Connect Coupler **FWD** ➔ ESP32 **GPIO 34**.
+- Connect Coupler **REV** ➔ ESP32 **GPIO 35**.
+- Connect Coupler **GND** ➔ ESP32 **GND**.
+
+---
+
+### Step 4: Firmware Calibration Constants (`src/main.cpp`)
+With 100 W trimmed to exactly 2.50 V on both channels, the math is:
+
+```text
+Power (W) = PWR_CAL_FACTOR * (V_fwd)^2
+100 W     = PWR_CAL_FACTOR * (2.50)^2
+100 W     = PWR_CAL_FACTOR * 6.25
+
+PWR_CAL_FACTOR = 100 / 6.25 = 16.0
+REV_CAL_FACTOR = 1.0 (since both trimpots are trimmed equally)
+```
+
+In `src/main.cpp` (lines 15–19), the constants are already configured for this standard:
+```cpp
+const float PWR_CAL_FACTOR = 16.0; // 100 W at 2.50 V (100 / 2.50^2 = 16.0)
+const float REV_CAL_FACTOR = 1.0;  // Balanced via hardware trimmer potentiometers
+```
+
+*(Note: If you calibrated to a different voltage such as 2.68 V, calculate `PWR_CAL_FACTOR = 100 / (2.68 * 2.68) = 13.85`).*
+
+---
+
+### Step 5: SWR Verification
+- Key into your 50 Ω dummy load: SWR should read **1.00 : 1** (up to 1.05 : 1) and Reflected Power should read `0.00 W`.
+- (Optional) If you connect a 100 Ω load or a 25 Ω load (two 50 Ω loads in parallel), the meter will read **2.00 : 1** SWR.
+
+---
+
 ## 📶 WiFi Configuration (No Hardcoded WiFi Required!)
 
 You do not need to hardcode your WiFi password in the firmware. The ESP32 stores WiFi credentials permanently in Flash memory (**NVS Preferences**).
@@ -81,42 +160,6 @@ If you prefer hardcoding default fallback credentials, edit lines 25–26 in [sr
 const char* DEFAULT_WIFI_SSID = "YOUR_WIFI_SSID";
 const char* DEFAULT_WIFI_PASS = "YOUR_WIFI_PASSWORD";
 ```
-
----
-
-## 🎯 Step-by-Step Calibration Guide
-
-Calibration takes only a couple of minutes. You need your **transceiver**, a trusted **50 Ω Dummy Load**, and an accurate reference power meter (or your transceiver's internal calibrated wattmeter).
-
-### Step 1: Forward Power Calibration (`PWR_CAL_FACTOR`)
-1. Connect: **Rig ➔ Coupler TX port ➔ Coupler ANT port ➔ 50 Ω Dummy Load**.
-2. Transmit a steady carrier (CW, FM, or RTTY) at a known power level, e.g. **100 W** (or 50 W).
-3. Check the detected voltage **`fwd_v`** displayed in the desktop app footer or Web UI (e.g. `2.68 V`).
-4. Calculate your calibration constant using the formula:
-   $$\text{PWR\_CAL\_FACTOR} = \frac{\text{Actual Power (W)}}{(V_{\text{fwd}})^2}$$
-   *Example:* If actual power is 100 W and $V_{\text{fwd}} = 2.68\text{ V}$:
-   $$\text{PWR\_CAL\_FACTOR} = \frac{100}{2.68 \times 2.68} = \frac{100}{7.1824} \approx 13.92$$
-5. Update line 15 in [src/main.cpp](file:///src/main.cpp):
-   ```cpp
-   const float PWR_CAL_FACTOR = 13.85; // Set your calculated value here
-   ```
-
-### Step 2: Reverse Channel Balance (`REV_CAL_FACTOR`)
-Due to minor component tolerances in diodes and ferrite binocular transformers, the reverse channel sensitivity is balanced against the forward channel:
-1. **Reverse the RF coaxial cables on the coupler:**
-   - Connect your Radio to the coupler's **ANT** port.
-   - Connect the 50 Ω Dummy Load to the coupler's **TX** port.
-2. Transmit at low power (e.g. **10 W** or **20 W**).
-3. The forward power now flows through the reverse detection winding, appearing as reflected voltage (`rev_v`).
-4. Observe `fwd_v` and `rev_v` in the monitor. Adjust `REV_CAL_FACTOR` on line 18 in [src/main.cpp](file:///src/main.cpp) so that `rev_v` exactly matches `fwd_v` (i.e., measured reflected power equals forward power):
-   ```cpp
-   const float REV_CAL_FACTOR = 1.35; // Adjust as needed for symmetry
-   ```
-5. **Restore the RF cables to normal:** (Radio ➔ TX, ANT ➔ Antenna / Dummy Load).
-
-### Step 3: SWR Verification
-- Transmit into your 50 Ω dummy load: SWR should read **1.00 : 1** (to 1.05 : 1) and reflected power `0.00 W`.
-- (Optional) If you connect a 100 Ω load or a 25 Ω load (two 50 Ω loads in parallel), the meter should read **2.00 : 1** SWR.
 
 ---
 

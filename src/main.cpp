@@ -12,11 +12,12 @@
 #define PIN_FWD 34
 #define PIN_REV 35
 
-// Calibration: 100 W mittarissa vastaa 100 W radiossa
-const float PWR_CAL_FACTOR = 13.85;
+// Calibration: 100 W = 2.50 V (100 / 2.50^2 = 16.0)
+// Adjusted via hardware trimmer potentiometers with a DMM prior to connecting ESP32
+const float PWR_CAL_FACTOR = 16.0;
 
-// REV-kanavan herkkyyskorjaus FWD-kanavan tasapainottamiseksi
-const float REV_CAL_FACTOR = 1.35;
+// REV channel balance factor (1.0 when trimpots are adjusted symmetrically with DMM)
+const float REV_CAL_FACTOR = 1.0;
 
 // ==========================================
 // WIFI SETTINGS & NVS STORAGE
