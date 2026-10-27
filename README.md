@@ -115,8 +115,8 @@ Both channels are now calibrated to equal sensitivity and capped at a completely
 
 ---
 
-### Step 4: Firmware Calibration Constants (`src/main.cpp`)
-With 100 W trimmed to exactly 2.50 V on both channels, the math is:
+### Step 4: Firmware Calibration & Live Web Calibration (`/cal`)
+With 100 W trimmed to 2.50 V on FWD, the power calibration formula is:
 
 ```text
 Power (W) = PWR_CAL_FACTOR * (V_fwd)^2
@@ -124,16 +124,15 @@ Power (W) = PWR_CAL_FACTOR * (V_fwd)^2
 100 W     = PWR_CAL_FACTOR * 6.25
 
 PWR_CAL_FACTOR = 100 / 6.25 = 16.0
-REV_CAL_FACTOR = 1.0 (since both trimpots are trimmed equally)
 ```
 
-In `src/main.cpp` (lines 15–19), the constants are already configured for this standard:
-```cpp
-const float PWR_CAL_FACTOR = 16.0; // 100 W at 2.50 V (100 / 2.50^2 = 16.0)
-const float REV_CAL_FACTOR = 1.0;  // Balanced via hardware trimmer potentiometers
-```
-
-*(Note: If you calibrated to a different voltage such as 2.68 V, calculate `PWR_CAL_FACTOR = 100 / (2.68 * 2.68) = 13.85`).*
+#### Software Fine-Tuning Without Opening the Enclosure:
+You do **not** need to reopen the enclosure or turn trimpots to fine-tune your meter!
+Open `http://<device-ip>:2222/cal` in any web browser to access the **Live Calibration Dashboard**:
+- **Power Scale Factor (`PWR_CAL`):** Default `16.00`. Fine-tune your forward wattage reading to match your transceiver's output.
+- **Reflected Balance Multiplier (`REV_CAL`):** Default `0.68`. Tandem-match / Stockton couplers often show slightly higher reflected voltage due to transformer winding asymmetry or high-frequency diode reactance. `0.68` balances the reflected channel and brings SWR on resonant antennas / non-reactive dummy loads to perfect parity with your radio.
+- **Reflected Baseline Offset (`REV_OFFSET`):** Default `0 mV`. Cancels residual RF common-mode directivity leakage on reactive wire antennas or loops.
+- **Non-Volatile Storage (NVS):** All values are stored directly in the ESP32's flash memory and persist across reboots.
 
 ---
 

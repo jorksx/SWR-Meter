@@ -12,12 +12,10 @@
 #define PIN_FWD 34
 #define PIN_REV 35
 
-// Calibration: 100 W = 2.50 V (100 / 2.50^2 = 16.0)
-// Adjusted via hardware trimmer potentiometers with a DMM prior to connecting ESP32
-const float PWR_CAL_FACTOR = 16.0;
-
-// REV channel balance factor (1.0 when trimpots are adjusted symmetrically with DMM)
-const float REV_CAL_FACTOR = 1.0;
+// Calibration defaults (adjustable live in Web UI at /cal, saved to NVS)
+volatile float pwrCalFactor = 16.0f; // 100 W = 2.50 V (100 / 2.50^2 = 16.0)
+volatile float revCalFactor = 0.68f; // Default 0.68 balances user coupler (corrects ~35% excess)
+volatile float revOffsetMv  = 0.0f;  // Reflected baseline offset in mV (for reactive antennas)
 
 // ==========================================
 // WIFI SETTINGS & NVS STORAGE
@@ -299,6 +297,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <h1>SWR & POWER MONITOR</h1>
       </div>
       <div style="display: flex; gap: 0.6rem; align-items: center;">
+        <a href="/cal" style="text-decoration: none; color: #62728d; background: #182030; border: 1px solid #243048; border-radius: 6px; padding: 0.35rem 0.75rem; font-size: 0.85rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; display: flex; align-items: center; gap: 4px; transition: all 0.2s;" onmouseover="this.style.color='#fff'; this.style.borderColor='#00ff88'" onmouseout="this.style.color='#62728d'; this.style.borderColor='#243048'">🎯 CAL</a>
         <a href="/wifi" style="text-decoration: none; color: #62728d; background: #182030; border: 1px solid #243048; border-radius: 6px; padding: 0.35rem 0.75rem; font-size: 0.85rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; display: flex; align-items: center; gap: 4px; transition: all 0.2s;" onmouseover="this.style.color='#fff'; this.style.borderColor='#00ff88'" onmouseout="this.style.color='#62728d'; this.style.borderColor='#243048'">⚙️ WIFI</a>
         <div id="wifi-badge" class="wifi-badge">📶 <span id="rssi-val">--</span> dBm</div>
         <div id="tx-badge" class="status-badge rx">RX</div>
@@ -728,6 +727,250 @@ void handleSaveWifi() {
   }
 }
 
+const char CAL_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Calibration - SWR & Power Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #090d14;
+      --card-bg: #121824;
+      --card-border: #1a2334;
+      --accent: #00ff88;
+      --text-main: #f0f4fc;
+      --text-muted: #62728d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text-main);
+      font-family: 'Rajdhani', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 500px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    h2 {
+      font-size: 1.5rem;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-bottom: 0.5rem;
+      color: #fff;
+    }
+    .tele-box {
+      background: #090d14;
+      border: 1px solid #1a2334;
+      border-radius: 10px;
+      padding: 1rem;
+      margin-bottom: 1.5rem;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+    .tele-item { display: flex; flex-direction: column; }
+    .tele-label { font-size: 0.8rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; }
+    .tele-val { font-family: 'JetBrains Mono', monospace; font-size: 1.3rem; font-weight: 700; color: #fff; }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 0.3rem;
+    }
+    .hint {
+      font-size: 0.8rem;
+      color: #55667e;
+      margin-bottom: 0.6rem;
+      line-height: 1.3;
+    }
+    input[type="number"] {
+      width: 100%;
+      padding: 0.75rem 1rem;
+      background: #090d14;
+      border: 1px solid #243048;
+      border-radius: 8px;
+      color: #fff;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.1rem;
+      margin-bottom: 0.4rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus { border-color: var(--accent); }
+    .btn {
+      width: 100%;
+      padding: 0.85rem;
+      background: #00ff88;
+      color: #090d14;
+      font-family: 'Rajdhani', sans-serif;
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: 1px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      text-transform: uppercase;
+      margin-top: 1rem;
+      transition: background 0.2s;
+    }
+    .btn:hover { background: #00e077; }
+    .toast {
+      display: none;
+      background: #143324;
+      border: 1px solid #00ff88;
+      color: #00ff88;
+      padding: 0.75rem;
+      border-radius: 8px;
+      text-align: center;
+      margin-top: 1rem;
+      font-weight: 700;
+    }
+    .back-link {
+      display: block;
+      text-align: center;
+      margin-top: 1.25rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    .back-link:hover { color: #fff; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🎯 Live Calibration</h2>
+    
+    <div class="tele-box">
+      <div class="tele-item">
+        <span class="tele-label">FWD Voltage</span>
+        <span id="fwd-v" class="tele-val" style="color:#00ff88;">0.00 V</span>
+      </div>
+      <div class="tele-item">
+        <span class="tele-label">REV Voltage</span>
+        <span id="rev-v" class="tele-val" style="color:#ff2a6d;">0.00 V</span>
+      </div>
+      <div class="tele-item">
+        <span class="tele-label">Forward Power</span>
+        <span id="fwd-p" class="tele-val">0.0 W</span>
+      </div>
+      <div class="tele-item">
+        <span class="tele-label">Calculated SWR</span>
+        <span id="swr-val" class="tele-val" style="color:#00e5ff;">1.00:1</span>
+      </div>
+    </div>
+
+    <form id="cal-form" onsubmit="saveCal(event)">
+      <label for="pwr_cal">Forward Power Multiplier (PWR_CAL)</label>
+      <div class="hint">Adjusts power scale. 16.0 = 100W at 2.50V (100 / 2.5² = 16.0).</div>
+      <input type="number" step="0.01" id="pwr_cal" name="pwr_cal" value="{PWR_CAL}" required>
+
+      <label for="rev_cal" style="margin-top:0.75rem;">Reflected Multiplier (REV_CAL)</label>
+      <div class="hint">Adjusts reverse channel sensitivity. Default 0.68 balances coupler to radio.</div>
+      <input type="number" step="0.01" id="rev_cal" name="rev_cal" value="{REV_CAL}" required>
+
+      <label for="rev_offset" style="margin-top:0.75rem;">Reflected Baseline Offset (mV)</label>
+      <div class="hint">Subtracts constant leakage or common-mode RF (e.g. 0 to 400 mV).</div>
+      <input type="number" step="1" id="rev_offset" name="rev_offset" value="{REV_OFF}" required>
+
+      <button type="submit" class="btn">💾 Save Calibration (Live)</button>
+    </form>
+    <div id="toast" class="toast">✅ Saved to Flash & applied instantly!</div>
+    <a href="/" class="back-link">← Return to Monitor</a>
+  </div>
+
+  <script>
+    async function updateTele() {
+      try {
+        const res = await fetch('/data');
+        if (res.ok) {
+          const d = await res.json();
+          document.getElementById('fwd-v').textContent = d.fwd_v.toFixed(2) + ' V';
+          document.getElementById('rev-v').textContent = d.rev_v.toFixed(2) + ' V';
+          document.getElementById('fwd-p').textContent = d.fwd_w.toFixed(1) + ' W';
+          document.getElementById('swr-val').textContent = (d.swr > 90 ? '>99' : d.swr.toFixed(2)) + ':1';
+        }
+      } catch(e) {}
+    }
+    setInterval(updateTele, 150);
+
+    async function saveCal(e) {
+      e.preventDefault();
+      const pwr = document.getElementById('pwr_cal').value;
+      const rev = document.getElementById('rev_cal').value;
+      const off = document.getElementById('rev_offset').value;
+      
+      const params = new URLSearchParams();
+      params.append('pwr_cal', pwr);
+      params.append('rev_cal', rev);
+      params.append('rev_offset', off);
+
+      try {
+        const res = await fetch('/save_cal', { method: 'POST', body: params });
+        if (res.ok) {
+          const t = document.getElementById('toast');
+          t.style.display = 'block';
+          setTimeout(() => t.style.display = 'none', 3000);
+        }
+      } catch(err) {
+        alert('Failed to save calibration');
+      }
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleCal() {
+  String html = FPSTR(CAL_HTML);
+  html.replace("{PWR_CAL}", String(pwrCalFactor, 2));
+  html.replace("{REV_CAL}", String(revCalFactor, 2));
+  html.replace("{REV_OFF}", String(revOffsetMv, 0));
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/html", html);
+}
+
+void handleSaveCal() {
+  if (server.hasArg("pwr_cal") && server.hasArg("rev_cal")) {
+    float newPwr = server.arg("pwr_cal").toFloat();
+    float newRev = server.arg("rev_cal").toFloat();
+    float newOff = server.hasArg("rev_offset") ? server.arg("rev_offset").toFloat() : 0.0f;
+
+    if (newPwr > 0.1f && newPwr < 200.0f) pwrCalFactor = newPwr;
+    if (newRev > 0.05f && newRev < 5.0f) revCalFactor = newRev;
+    if (newOff >= 0.0f && newOff < 1000.0f) revOffsetMv = newOff;
+
+    preferences.begin("swr_cfg", false);
+    preferences.putFloat("pwr_cal", pwrCalFactor);
+    preferences.putFloat("rev_cal", revCalFactor);
+    preferences.putFloat("rev_off", revOffsetMv);
+    preferences.end();
+
+    server.sendHeader("Connection", "close");
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+  } else {
+    server.send(400, "text/plain", "Missing parameters");
+  }
+}
+
 void handleRoot() {
   server.sendHeader("Connection", "close");
   server.send_P(200, "text/html", INDEX_HTML);
@@ -745,6 +988,9 @@ void handleData() {
   json += "\"raw_fwd\":" + String(lastRawFwd) + ",";
   json += "\"raw_rev\":" + String(lastRawRev) + ",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"pwr_cal\":" + String(pwrCalFactor, 2) + ",";
+  json += "\"rev_cal\":" + String(revCalFactor, 3) + ",";
+  json += "\"rev_off\":" + String(revOffsetMv, 1) + ",";
   json += "\"filt\":true,";
   json += "\"tx\":" + String(isTransmitting ? "true" : "false");
   json += "}";
@@ -825,12 +1071,13 @@ void samplingTask(void *pvParameters) {
       float instVfwd = (sumFwd / (float)SAMPLES) / 1000.0f;
       if (instVfwd < 0.0f) instVfwd = 0.0f;
 
-      // Kohinasalpa: Jos heijastus on ESP32:n ADC-nollalattian (n. 155 mV) alapuolella,
-      // kyseessä on pelkkä pohjakohina -> heijastus = 0.
+      // Kohinasalpa & offset-korjaus:
+      // Vähennetään mahdollinen yhteismuotoinen/reaktiivinen pohjavuoto (revOffsetMv)
       float rawMvRev = (sumRev / (float)SAMPLES);
       float instVrev = 0.0f;
-      if (rawMvRev > 155.0f) {
-        instVrev = (rawMvRev / 1000.0f) * REV_CAL_FACTOR;
+      float effMvRev = rawMvRev - revOffsetMv;
+      if (effMvRev > 155.0f) {
+        instVrev = (effMvRev / 1000.0f) * revCalFactor;
       }
 
       // Ensimmäinen TX-sykli: alustetaan jännitteet heti
@@ -851,8 +1098,8 @@ void samplingTask(void *pvParameters) {
       currentVfwd = filtVfwd;
       currentVrev = filtVrev;
 
-      float pFwd = PWR_CAL_FACTOR * (filtVfwd * filtVfwd);
-      float pRev = PWR_CAL_FACTOR * (filtVrev * filtVrev);
+      float pFwd = pwrCalFactor * (filtVfwd * filtVfwd);
+      float pRev = pwrCalFactor * (filtVrev * filtVrev);
 
       currentPfwd = pFwd;
       currentPrev = pRev;
@@ -920,10 +1167,13 @@ void setup() {
     0 // Core 0
   );
 
-  // Load WiFi settings from Flash (NVS)
+  // Load WiFi settings and Calibration from Flash (NVS)
   preferences.begin("swr_cfg", false);
   String activeSsid = preferences.getString("ssid", DEFAULT_WIFI_SSID);
   String activePass = preferences.getString("pass", DEFAULT_WIFI_PASS);
+  pwrCalFactor = preferences.getFloat("pwr_cal", 16.0f);
+  revCalFactor = preferences.getFloat("rev_cal", 0.68f);
+  revOffsetMv  = preferences.getFloat("rev_off", 0.0f);
   preferences.end();
 
   WiFi.mode(WIFI_AP_STA);
@@ -957,6 +1207,8 @@ void setup() {
   server.on("/data", handleData);
   server.on("/wifi", handleWifi);
   server.on("/save_wifi", HTTP_POST, handleSaveWifi);
+  server.on("/cal", handleCal);
+  server.on("/save_cal", HTTP_POST, handleSaveCal);
 
   // Web OTA päivitys suoraan selaimesta
   server.on("/update", HTTP_POST, []() {
