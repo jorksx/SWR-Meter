@@ -435,20 +435,14 @@ class SWRMeterApp:
         swr_hdr = tk.Frame(self.mod_swr_card, bg="#121824")
         swr_hdr.pack(fill="x", padx=12, pady=(6, 0))
         tk.Label(swr_hdr, text="ANTENNA SWR (LINE)", font=("Arial", 8, "bold"), fg="#62728d", bg="#121824").pack(side="left")
-        self.mod_atu_badge = tk.Label(swr_hdr, text="ATU: IDLE", font=("Consolas", 8, "bold"), fg="#62728d", bg="#121824")
-        self.mod_atu_badge.pack(side="right")
+        self.mod_pa_lbl = tk.Label(swr_hdr, text="PA / RIG SWR: 1.00:1", font=("Consolas", 9, "bold"), fg="#62728d", bg="#121824")
+        self.mod_pa_lbl.pack(side="right")
 
         swr_val_f = tk.Frame(self.mod_swr_card, bg="#121824")
         swr_val_f.pack(fill="x", padx=12, pady=(0, 2))
         self.mod_swr_num = tk.Label(swr_val_f, text="1.00", font=("Consolas", 32, "bold"), fg="#00ff88", bg="#121824")
         self.mod_swr_num.pack(side="left")
         tk.Label(swr_val_f, text=" :1", font=("Consolas", 14), fg="#62728d", bg="#121824").pack(side="left", pady=(10, 0))
-
-        pa_box = tk.Frame(swr_val_f, bg="#121824")
-        pa_box.pack(side="right", pady=(4, 0))
-        tk.Label(pa_box, text="PA / RIG SWR", font=("Arial", 7, "bold"), fg="#62728d", bg="#121824").pack(anchor="e")
-        self.mod_pa_val_lbl = tk.Label(pa_box, text="1.00 :1", font=("Consolas", 15, "bold"), fg="#00ff88", bg="#121824")
-        self.mod_pa_val_lbl.pack(anchor="e")
 
         self.mod_swr_canvas = tk.Canvas(self.mod_swr_card, height=11, bg="#080c14", highlightthickness=1, highlightbackground="#1a2334")
         self.mod_swr_canvas.pack(fill="x", padx=12, pady=(2, 3))
@@ -926,17 +920,9 @@ class SWRMeterApp:
             self.mod_swr_num.configure(text=swr_str, fg=swr_c)
 
             if not self.tx or self.fwd_w < 3.0:
-                self.mod_atu_badge.configure(text="ATU: IDLE", fg="#62728d")
-                self.mod_pa_val_lbl.configure(text="1.00 :1", fg="#62728d")
-            elif atu_status == "ATU: MATCHED":
-                self.mod_atu_badge.configure(text="🟢 ATU: MATCHED", fg="#00ff88")
-                self.mod_pa_val_lbl.configure(text="1.00 :1", fg="#00ff88")
-            elif atu_status == "PA FOLDBACK":
-                self.mod_atu_badge.configure(text="⚠️ PA FOLDBACK", fg="#ffaa00")
-                self.mod_pa_val_lbl.configure(text=f"{pa_str} :1", fg=pa_c)
+                self.mod_pa_lbl.configure(text="PA / RIG SWR: 1.00:1", fg="#62728d")
             else:
-                self.mod_atu_badge.configure(text="PA OK", fg="#00ff88")
-                self.mod_pa_val_lbl.configure(text=f"{pa_str} :1", fg=pa_c)
+                self.mod_pa_lbl.configure(text=f"PA / RIG SWR: {pa_str}:1", fg=pa_c)
 
             self.mod_rev_lbl.configure(text=f"REFLECTED: {self.rev_w:.2f} W")
             self.mod_peak_lbl.configure(text=f"PEAK: {self.peak_w:.1f} W")
