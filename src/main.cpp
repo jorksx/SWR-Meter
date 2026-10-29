@@ -13,9 +13,9 @@
 #define PIN_REV 35
 
 // Calibration defaults (adjustable live in Web UI at /cal, saved to NVS)
-volatile float pwrCalFactor = 16.0f; // 100 W = 2.50 V (100 / 2.50^2 = 16.0)
-volatile float revCalFactor = 0.68f; // Default 0.68 balances user coupler (corrects ~35% excess)
-volatile float revOffsetMv  = 0.0f;  // Reflected baseline offset in mV (for reactive antennas)
+volatile float pwrCalFactor  = 12.80f; // 100 W = 2.80 V (100 / 2.80^2 = 12.76)
+volatile float revCalFactor  = 1.55f;  // Coupler SWR scale multiplier (matches rig)
+volatile float dirLeakFactor = 0.192f; // Stockton bridge directivity isolation floor (-14.3 dB)
 
 // ==========================================
 // WIFI SETTINGS & NVS STORAGE
@@ -880,16 +880,16 @@ const char CAL_HTML[] PROGMEM = R"rawliteral(
 
     <form id="cal-form" onsubmit="saveCal(event)">
       <label for="pwr_cal">Forward Power Multiplier (PWR_CAL)</label>
-      <div class="hint">Adjusts power scale. 16.0 = 100W at 2.50V (100 / 2.5² = 16.0).</div>
+      <div class="hint">Adjusts power scale. 12.80 = 100W at 2.80V (100 / 2.80² ≈ 12.8).</div>
       <input type="number" step="0.01" id="pwr_cal" name="pwr_cal" value="{PWR_CAL}" required>
 
-      <label for="rev_cal" style="margin-top:0.75rem;">Reflected Multiplier (REV_CAL)</label>
-      <div class="hint">Adjusts reverse channel sensitivity. Default 0.68 balances coupler to radio.</div>
+      <label for="rev_cal" style="margin-top:0.75rem;">SWR Scale Multiplier (REV_CAL)</label>
+      <div class="hint">Calibrates SWR sensitivity curve. Default 1.55 matches Rig SWR.</div>
       <input type="number" step="0.01" id="rev_cal" name="rev_cal" value="{REV_CAL}" required>
 
-      <label for="rev_offset" style="margin-top:0.75rem;">Reflected Baseline Offset (mV)</label>
-      <div class="hint">Subtracts constant leakage or common-mode RF (e.g. 0 to 400 mV).</div>
-      <input type="number" step="1" id="rev_offset" name="rev_offset" value="{REV_OFF}" required>
+      <label for="dir_leak" style="margin-top:0.75rem;">Coupler Directivity Isolation (DIR_LEAK)</label>
+      <div class="hint">Cancels internal bridge leakage. Default 0.192 (~ -14.3 dB) gives 1.00 on matched loads.</div>
+      <input type="number" step="0.001" id="dir_leak" name="dir_leak" value="{DIR_LEAK}" required>
 
       <button type="submit" class="btn">💾 Save Calibration (Live)</button>
     </form>
@@ -916,12 +916,12 @@ const char CAL_HTML[] PROGMEM = R"rawliteral(
       e.preventDefault();
       const pwr = document.getElementById('pwr_cal').value;
       const rev = document.getElementById('rev_cal').value;
-      const off = document.getElementById('rev_offset').value;
+      const leak = document.getElementById('dir_leak').value;
       
       const params = new URLSearchParams();
       params.append('pwr_cal', pwr);
       params.append('rev_cal', rev);
-      params.append('rev_offset', off);
+      params.append('dir_leak', leak);
 
       try {
         const res = await fetch('/save_cal', { method: 'POST', body: params });
@@ -943,7 +943,7 @@ void handleCal() {
   String html = FPSTR(CAL_HTML);
   html.replace("{PWR_CAL}", String(pwrCalFactor, 2));
   html.replace("{REV_CAL}", String(revCalFactor, 2));
-  html.replace("{REV_OFF}", String(revOffsetMv, 0));
+  html.replace("{DIR_LEAK}", String(dirLeakFactor, 3));
   server.sendHeader("Connection", "close");
   server.send(200, "text/html", html);
 }
@@ -952,16 +952,17 @@ void handleSaveCal() {
   if (server.hasArg("pwr_cal") && server.hasArg("rev_cal")) {
     float newPwr = server.arg("pwr_cal").toFloat();
     float newRev = server.arg("rev_cal").toFloat();
-    float newOff = server.hasArg("rev_offset") ? server.arg("rev_offset").toFloat() : 0.0f;
+    float newLeak = server.hasArg("dir_leak") ? server.arg("dir_leak").toFloat() : 
+                   (server.hasArg("rev_offset") ? server.arg("rev_offset").toFloat() / 1000.0f : 0.192f);
 
     if (newPwr > 0.1f && newPwr < 200.0f) pwrCalFactor = newPwr;
-    if (newRev > 0.05f && newRev < 5.0f) revCalFactor = newRev;
-    if (newOff >= 0.0f && newOff < 1000.0f) revOffsetMv = newOff;
+    if (newRev > 0.05f && newRev < 10.0f) revCalFactor = newRev;
+    if (newLeak >= 0.0f && newLeak < 0.5f) dirLeakFactor = newLeak;
 
     preferences.begin("swr_cfg", false);
     preferences.putFloat("pwr_cal", pwrCalFactor);
     preferences.putFloat("rev_cal", revCalFactor);
-    preferences.putFloat("rev_off", revOffsetMv);
+    preferences.putFloat("dir_leak", dirLeakFactor);
     preferences.end();
 
     server.sendHeader("Connection", "close");
@@ -989,8 +990,8 @@ void handleData() {
   json += "\"raw_rev\":" + String(lastRawRev) + ",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   json += "\"pwr_cal\":" + String(pwrCalFactor, 2) + ",";
-  json += "\"rev_cal\":" + String(revCalFactor, 3) + ",";
-  json += "\"rev_off\":" + String(revOffsetMv, 1) + ",";
+  json += "\"rev_cal\":" + String(revCalFactor, 2) + ",";
+  json += "\"dir_leak\":" + String(dirLeakFactor, 3) + ",";
   json += "\"filt\":true,";
   json += "\"tx\":" + String(isTransmitting ? "true" : "false");
   json += "}";
@@ -1071,14 +1072,23 @@ void samplingTask(void *pvParameters) {
       float instVfwd = (sumFwd / (float)SAMPLES) / 1000.0f;
       if (instVfwd < 0.0f) instVfwd = 0.0f;
 
-      // Kohinasalpa & offset-korjaus:
-      // Vähennetään mahdollinen yhteismuotoinen/reaktiivinen pohjavuoto (revOffsetMv)
-      float rawMvRev = (sumRev / (float)SAMPLES);
-      float instVrev = 0.0f;
-      float effMvRev = rawMvRev - revOffsetMv;
-      if (effMvRev > 155.0f) {
-        instVrev = (effMvRev / 1000.0f) * revCalFactor;
+      float rawVrev = (sumRev / (float)SAMPLES) / 1000.0f;
+      if (rawVrev < 0.0f) rawVrev = 0.0f;
+
+      // Suuntakytkimen eristysvuodon poisto (Directivity isolation in quadrature):
+      // Stockton-sillan luontainen eristysvuoto (D ~ 0.192, n. -14.3 dB)
+      float gamma = 0.0f;
+      if (instVfwd > 0.05f) {
+        float ratio = rawVrev / instVfwd;
+        float diffSq = ratio * ratio - dirLeakFactor * dirLeakFactor;
+        if (diffSq > 0.0f) {
+          gamma = sqrtf(diffSq) * revCalFactor;
+          if (gamma > 0.98f) gamma = 0.98f;
+        }
       }
+
+      // Todellinen puhdistettu heijastusjännite:
+      float instVrev = gamma * instVfwd;
 
       // Ensimmäinen TX-sykli: alustetaan jännitteet heti
       if (!wasTx) {
@@ -1099,7 +1109,9 @@ void samplingTask(void *pvParameters) {
       currentVrev = filtVrev;
 
       float pFwd = pwrCalFactor * (filtVfwd * filtVfwd);
-      float pRev = pwrCalFactor * (filtVrev * filtVrev);
+      float filtGamma = (filtVfwd > 0.001f) ? (filtVrev / filtVfwd) : 0.0f;
+      if (filtGamma > 0.98f) filtGamma = 0.98f;
+      float pRev = pFwd * (filtGamma * filtGamma);
 
       currentPfwd = pFwd;
       currentPrev = pRev;
@@ -1120,8 +1132,8 @@ void samplingTask(void *pvParameters) {
 
       // SWR laskenta suodatetuista jännitteistä vasta kun kantoaalto on tasaantunut (~20ms)
       if (txSettleCycles >= 3) {
-        if (filtVfwd > 0.08f && filtVfwd > filtVrev) {
-          float rawSwr = (filtVfwd + filtVrev) / (filtVfwd - filtVrev);
+        if (filtVfwd > 0.08f) {
+          float rawSwr = (1.0f + filtGamma) / (1.0f - filtGamma);
           if (rawSwr > 99.0f) rawSwr = 99.0f;
           
           if (txSettleCycles == 3) {
@@ -1130,8 +1142,6 @@ void samplingTask(void *pvParameters) {
             filtSwr += 0.12f * (rawSwr - filtSwr);
           }
           currentSwr = filtSwr;
-        } else if (filtVfwd > 0.08f) {
-          currentSwr = 99.0f; // Täysi heijastus tai Rev >= Fwd
         } else {
           currentSwr = 1.0f;
         }
@@ -1171,9 +1181,9 @@ void setup() {
   preferences.begin("swr_cfg", false);
   String activeSsid = preferences.getString("ssid", DEFAULT_WIFI_SSID);
   String activePass = preferences.getString("pass", DEFAULT_WIFI_PASS);
-  pwrCalFactor = preferences.getFloat("pwr_cal", 16.0f);
-  revCalFactor = preferences.getFloat("rev_cal", 0.68f);
-  revOffsetMv  = preferences.getFloat("rev_off", 0.0f);
+  pwrCalFactor  = preferences.getFloat("pwr_cal", 12.80f);
+  revCalFactor  = preferences.getFloat("rev_cal", 1.55f);
+  dirLeakFactor = preferences.getFloat("dir_leak", 0.192f);
   preferences.end();
 
   WiFi.mode(WIFI_AP_STA);

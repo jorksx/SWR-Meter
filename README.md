@@ -116,22 +116,20 @@ Both channels are now calibrated to equal sensitivity and capped at a completely
 ---
 
 ### Step 4: Firmware Calibration & Live Web Calibration (`/cal`)
-With 100 W trimmed to 2.50 V on FWD, the power calibration formula is:
+With 100 W producing ~2.80 V on FWD, the power calibration formula is:
 
 ```text
-Power (W) = PWR_CAL_FACTOR * (V_fwd)^2
-100 W     = PWR_CAL_FACTOR * (2.50)^2
-100 W     = PWR_CAL_FACTOR * 6.25
-
-PWR_CAL_FACTOR = 100 / 6.25 = 16.0
+Power (W) = PWR_CAL * (V_fwd)^2
+100 W     = 12.80 * (2.80)^2
+100 W     = 12.80 * 7.84 ≈ 100 W
 ```
 
 #### Software Fine-Tuning Without Opening the Enclosure:
 You do **not** need to reopen the enclosure or turn trimpots to fine-tune your meter!
 Open `http://<device-ip>:2222/cal` in any web browser to access the **Live Calibration Dashboard**:
-- **Power Scale Factor (`PWR_CAL`):** Default `16.00`. Fine-tune your forward wattage reading to match your transceiver's output.
-- **Reflected Balance Multiplier (`REV_CAL`):** Default `0.68`. Tandem-match / Stockton couplers often show slightly higher reflected voltage due to transformer winding asymmetry or high-frequency diode reactance. `0.68` balances the reflected channel and brings SWR on resonant antennas / non-reactive dummy loads to perfect parity with your radio.
-- **Reflected Baseline Offset (`REV_OFFSET`):** Default `0 mV`. Cancels residual RF common-mode directivity leakage on reactive wire antennas or loops.
+- **Power Scale Factor (`PWR_CAL`):** Default `12.80`. Calibrates forward wattage to match your transceiver across all HF bands.
+- **SWR Scale Multiplier (`REV_CAL`):** Default `1.55`. Calibrates the directional coupler reflection coefficient curve, matching the radio's SWR meter on high SWR (e.g. 2.0, 2.5, 3.0).
+- **Coupler Directivity Isolation (`DIR_LEAK`):** Default `0.192` (~ -14.3 dB). Cancels internal Stockton bridge quadrature directivity leakage and common-mode floor, yielding a true `1.00 : 1` on resonant matched antennas and dummy loads.
 - **Non-Volatile Storage (NVS):** All values are stored directly in the ESP32's flash memory and persist across reboots.
 
 ---
