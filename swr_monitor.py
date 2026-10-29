@@ -118,6 +118,31 @@ def draw_gradient_bar(canvas, w, h, fill_px, lut, peak_w=0.0):
             canvas.create_line(peak_px, 0, peak_px, h, fill="#ffffff", width=2)
 
 
+def estimate_pa_swr(fwd_w, line_swr):
+    """
+    Arvioi radion pääteasteen (PA) näkemän SWR:n tehon ja linja-SWR:n perusteella.
+    Kun sisäinen viritin (ATU) sovittaa kuorman, radio antaa täyden tehon (>= 80W)
+    vaikka linja-SWR olisi korkea -> PA: 1.0 :1 (ATU MATCHED).
+    Jos radio rajoittaa tehoa (foldback), arvioidaan PA-SWR tehonpudotuksen perusteella.
+    """
+    if fwd_w < 5.0:
+        return 1.0, "IDLE"
+    if fwd_w >= 80.0:
+        return 1.0, "ATU: MATCHED"
+    if line_swr <= 1.5:
+        return line_swr, "PA OK"
+    
+    # Tehonpudotuskäyrä (100W nimellisteholle):
+    if fwd_w >= 65.0:
+        est = 1.0 + (80.0 - fwd_w) / 15.0 * 0.8
+        return min(line_swr, round(est, 2)), "PA FOLDBACK"
+    elif fwd_w >= 45.0:
+        est = 1.8 + (65.0 - fwd_w) / 20.0 * 1.0
+        return min(line_swr, round(est, 2)), "PA FOLDBACK"
+    else:
+        return line_swr, "HIGH SWR"
+
+
 class SWRMeterApp:
     def __init__(self, root):
         self.root = root
@@ -290,7 +315,12 @@ class SWRMeterApp:
                 elif (swr - self.prev_swr) >= 0.85 and self.prev_swr < 2.5:
                     anomaly = f"ÄKILLINEN SWR-HYPPY (+{swr - self.prev_swr:.2f} -> {swr:.2f}:1)!"
                 elif swr >= 3.0:
-                    anomaly = f"KORKEA SWR ({swr:.2f}:1) - TARKISTA ANTENNI!"
+                    if fwd_w >= 75.0:
+                        # Sisäinen viritin (ATU) sovittanut pääteasteen ja täysi teho kulkee turvallisesti!
+                        # Ei huudeta punaista hälytystä, koska PA ei ole vaarassa.
+                        pass
+                    else:
+                        anomaly = f"KORKEA SWR ({swr:.2f}:1) - PA RAJOITTAA TEHOA ({fwd_w:.0f}W)!"
 
                 self.prev_swr = swr
         else:
@@ -397,14 +427,32 @@ class SWRMeterApp:
 
         self.mod_swr_card = tk.Frame(self.view_modern, bg="#121824", highlightthickness=1, highlightbackground="#1a2334")
         self.mod_swr_card.pack(fill="x", pady=4)
-        tk.Label(self.mod_swr_card, text="SWR", font=("Arial", 8, "bold"), fg="#62728d", bg="#121824").pack(anchor="w", padx=12, pady=(6, 0))
+
+        swr_hdr = tk.Frame(self.mod_swr_card, bg="#121824")
+        swr_hdr.pack(fill="x", padx=12, pady=(6, 0))
+        tk.Label(swr_hdr, text="ANTENNA SWR (LINE)", font=("Arial", 8, "bold"), fg="#62728d", bg="#121824").pack(side="left")
+        self.mod_atu_badge = tk.Label(swr_hdr, text="ATU: IDLE", font=("Consolas", 8, "bold"), fg="#62728d", bg="#121824")
+        self.mod_atu_badge.pack(side="right")
+
         swr_val_f = tk.Frame(self.mod_swr_card, bg="#121824")
-        swr_val_f.pack(anchor="w", padx=12, pady=(0, 2))
+        swr_val_f.pack(fill="x", padx=12, pady=(0, 2))
         self.mod_swr_num = tk.Label(swr_val_f, text="1.00", font=("Consolas", 32, "bold"), fg="#00ff88", bg="#121824")
         self.mod_swr_num.pack(side="left")
         tk.Label(swr_val_f, text=" :1", font=("Consolas", 14), fg="#62728d", bg="#121824").pack(side="left", pady=(10, 0))
-        self.mod_swr_canvas = tk.Canvas(self.mod_swr_card, height=13, bg="#080c14", highlightthickness=1, highlightbackground="#1a2334")
-        self.mod_swr_canvas.pack(fill="x", padx=12, pady=(2, 8))
+
+        pa_box = tk.Frame(swr_val_f, bg="#121824")
+        pa_box.pack(side="right", pady=(4, 0))
+        tk.Label(pa_box, text="PA / RIG SWR", font=("Arial", 7, "bold"), fg="#62728d", bg="#121824").pack(anchor="e")
+        self.mod_pa_val_lbl = tk.Label(pa_box, text="1.00 :1", font=("Consolas", 15, "bold"), fg="#00ff88", bg="#121824")
+        self.mod_pa_val_lbl.pack(anchor="e")
+
+        self.mod_swr_canvas = tk.Canvas(self.mod_swr_card, height=11, bg="#080c14", highlightthickness=1, highlightbackground="#1a2334")
+        self.mod_swr_canvas.pack(fill="x", padx=12, pady=(2, 3))
+
+        pa_bar_f = tk.Frame(self.mod_swr_card, bg="#121824")
+        pa_bar_f.pack(fill="x", padx=12, pady=(1, 6))
+        self.mod_pa_canvas = tk.Canvas(pa_bar_f, height=6, bg="#080c14", highlightthickness=1, highlightbackground="#1a2334")
+        self.mod_pa_canvas.pack(fill="x")
 
         self.mod_footer = tk.Frame(self.view_modern, bg="#121824", highlightthickness=1, highlightbackground="#1a2334")
         self.mod_footer.pack(fill="x", pady=(4, 0))
@@ -864,10 +912,27 @@ class SWRMeterApp:
             swr_c = get_swr_color(self.swr)
             swr_str = ">99" if self.swr > 90 else f"{self.swr:.2f}"
 
+            pa_swr, atu_status = estimate_pa_swr(self.fwd_w, self.swr)
+            pa_c = get_swr_color(pa_swr)
+            pa_str = ">99" if pa_swr > 90 else f"{pa_swr:.2f}"
+
             self.mod_pwr_num.configure(text=f"{self.fwd_w:.1f}", fg=pwr_c)
             self.mod_pep_txt.configure(text=f"{self.fwd_w:.1f} W", fg=pwr_c)
             self.mod_avg_txt.configure(text=f"{self.avg_w:.1f} W", fg=avg_c)
             self.mod_swr_num.configure(text=swr_str, fg=swr_c)
+
+            if not self.tx or self.fwd_w < 3.0:
+                self.mod_atu_badge.configure(text="ATU: IDLE", fg="#62728d")
+                self.mod_pa_val_lbl.configure(text="1.00 :1", fg="#62728d")
+            elif atu_status == "ATU: MATCHED":
+                self.mod_atu_badge.configure(text="🟢 ATU: MATCHED", fg="#00ff88")
+                self.mod_pa_val_lbl.configure(text="1.00 :1", fg="#00ff88")
+            elif atu_status == "PA FOLDBACK":
+                self.mod_atu_badge.configure(text="⚠️ PA FOLDBACK", fg="#ffaa00")
+                self.mod_pa_val_lbl.configure(text=f"{pa_str} :1", fg=pa_c)
+            else:
+                self.mod_atu_badge.configure(text="PA OK", fg="#00ff88")
+                self.mod_pa_val_lbl.configure(text=f"{pa_str} :1", fg=pa_c)
 
             self.mod_rev_lbl.configure(text=f"REFLECTED: {self.rev_w:.2f} W")
             self.mod_peak_lbl.configure(text=f"PEAK: {self.peak_w:.1f} W")
@@ -883,11 +948,19 @@ class SWRMeterApp:
                 fill_avg = int(min(w_a, (self.avg_w / 120.0) * w_a))
                 draw_gradient_bar(self.mod_avg_canvas, w_a, 11, fill_avg, self.pwr_lut, peak_w=0.0)
 
+            # Linja-SWR palkki
             w_s = self.mod_swr_canvas.winfo_width()
             if w_s > 1:
                 ratio_s = 1.0 if self.swr > 90 else min(1.0, max(0.0, (self.swr - 1.0) / 4.0))
                 fill_swr = int(w_s * ratio_s)
-                draw_gradient_bar(self.mod_swr_canvas, w_s, 13, fill_swr, self.swr_lut, peak_w=0.0)
+                draw_gradient_bar(self.mod_swr_canvas, w_s, 11, fill_swr, self.swr_lut, peak_w=0.0)
+
+            # PA / Rig SWR palkki
+            w_pa = self.mod_pa_canvas.winfo_width()
+            if w_pa > 1:
+                ratio_pa = 1.0 if pa_swr > 90 else min(1.0, max(0.0, (pa_swr - 1.0) / 4.0))
+                fill_pa = int(w_pa * ratio_pa)
+                draw_gradient_bar(self.mod_pa_canvas, w_pa, 6, fill_pa, self.swr_lut, peak_w=0.0)
 
         # =========================================================================
         # THEME 2: CROSS-NEEDLE PÄIVITYS (Tumma tausta ja vaimennetut neulat)
@@ -948,7 +1021,11 @@ class SWRMeterApp:
             swr_c = get_swr_color(self.swr)
             swr_str = ">99" if self.swr > 90 else f"{self.swr:.2f}"
             self.cn_fwd_lbl.configure(text=f"FWD: {self.fwd_w:.1f} W", fg=pwr_c)
-            self.cn_swr_lbl.configure(text=f"SWR: {swr_str}:1", fg=swr_c)
+            pa_swr, atu_status = estimate_pa_swr(self.fwd_w, self.swr)
+            if atu_status == "ATU: MATCHED":
+                self.cn_swr_lbl.configure(text=f"SWR: {swr_str}:1 [ATU 1:1]", fg="#00ff88")
+            else:
+                self.cn_swr_lbl.configure(text=f"SWR: {swr_str}:1", fg=swr_c)
             self.cn_rev_lbl.configure(text=f"REF: {self.rev_w:.2f} W")
             self.cn_pep_lbl.configure(text=f"PEAK: {self.peak_w:.1f} W")
             self.cn_avg_lbl.configure(text=f"AVG: {self.avg_w:.1f} W")

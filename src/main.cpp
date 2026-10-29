@@ -14,7 +14,7 @@
 
 // Calibration defaults (adjustable live in Web UI at /cal, saved to NVS)
 volatile float pwrCalFactor  = 12.80f; // 100 W = 2.80 V (100 / 2.80^2 = 12.76)
-volatile float revCalFactor  = 1.55f;  // Coupler SWR scale multiplier (matches rig)
+volatile float revCalFactor  = 1.00f;  // Pure directivity-compensated SWR (1:1 with rig)
 volatile float dirLeakFactor = 0.192f; // Stockton bridge directivity isolation floor (-14.3 dB)
 
 // ==========================================
@@ -1182,7 +1182,7 @@ void setup() {
   String activeSsid = preferences.getString("ssid", DEFAULT_WIFI_SSID);
   String activePass = preferences.getString("pass", DEFAULT_WIFI_PASS);
   pwrCalFactor  = preferences.getFloat("pwr_cal", 12.80f);
-  revCalFactor  = preferences.getFloat("rev_cal", 1.55f);
+  revCalFactor  = preferences.getFloat("rev_cal", 1.00f);
   dirLeakFactor = preferences.getFloat("dir_leak", 0.192f);
   preferences.end();
 
