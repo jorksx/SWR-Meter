@@ -305,9 +305,12 @@ class SWRMeterApp:
             if not self.was_tx:
                 self.tx_start_time = now
                 self.was_tx = True
+                self.prev_swr = swr
             tx_duration = now - self.tx_start_time
 
-            if tx_duration > 0.30 and fwd_w > 8.0:
+            # 2 sekunnin turvaraja lähetyksen alussa: kantoaallon nousu, suodattimet
+            # ja releet saavat tasaantua rauhassa ilman vääriä hälytyksiä.
+            if tx_duration > 2.0 and fwd_w > 8.0:
                 if rev_v > (fwd_v * 1.05) and rev_v > 0.15:
                     anomaly = f"ANOMALIA: REV-JÄNNITE ({rev_v:.2f}V) > FWD ({fwd_v:.2f}V)!"
                 elif fwd_v >= 3.05:
@@ -322,6 +325,7 @@ class SWRMeterApp:
                     else:
                         anomaly = f"KORKEA SWR ({swr:.2f}:1) - PA RAJOITTAA TEHOA ({fwd_w:.0f}W)!"
 
+            if tx_duration > 1.5:
                 self.prev_swr = swr
         else:
             self.was_tx = False
