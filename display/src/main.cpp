@@ -279,16 +279,6 @@ void telemetryTask(void *pvParameters) {
             continue;
         }
 
-        // Initialize mDNS hostname when WiFi connects
-        static bool mdnsInitialized = false;
-        if (!mdnsInitialized && WiFi.status() == WL_CONNECTED) {
-            if (MDNS.begin("swrdisplay")) {
-                MDNS.addService("http", "tcp", 80);
-                mdnsInitialized = true;
-                Serial.printf("[MDNS] Active: http://swrdisplay.local (IP: %s)\n", WiFi.localIP().toString().c_str());
-            }
-        }
-
         tele.rssi = WiFi.RSSI();
         const char* targetUrl = NET_TARGETS[curIdx].url;
 
@@ -984,7 +974,26 @@ void setup() {
         0 // Core 0
     );
 
-    // 5. Initialize Web OTA Server (Port 80)
+    lastActivityTime = millis();
+    isBacklightOn = true;
+
+    delay(400);
+}
+
+// =========================================================================
+// OTA INITIALIZATION (SAFELY CALLED ONLY ONCE WIFI IS CONNECTED)
+// =========================================================================
+static bool otaInitialized = false;
+
+void initOTAOnceConnected() {
+    if (otaInitialized || WiFi.status() != WL_CONNECTED) return;
+
+    if (MDNS.begin("swrdisplay")) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("arduino", "tcp", 3232);
+        Serial.printf("[OTA] mDNS active: http://swrdisplay.local (IP: %s)\n", WiFi.localIP().toString().c_str());
+    }
+
     otaServer.on("/", HTTP_GET, []() {
         otaServer.sendHeader("Connection", "close");
         otaServer.send_P(200, "text/html", OTA_INDEX_HTML);
@@ -1017,14 +1026,11 @@ void setup() {
 
     otaServer.begin();
 
-    // 6. Initialize ArduinoOTA (Port 3232)
     ArduinoOTA.setHostname("swrdisplay");
     ArduinoOTA.begin();
 
-    lastActivityTime = millis();
-    isBacklightOn = true;
-
-    delay(600);
+    otaInitialized = true;
+    Serial.println("[OTA] ArduinoOTA and WebServer started successfully!");
 }
 
 // =========================================================================
@@ -1033,9 +1039,14 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // 1. Handle OTA requests (Web OTA on port 80 & ArduinoOTA on port 3232)
-    otaServer.handleClient();
-    ArduinoOTA.handle();
+    // 1. Service OTA safely if WiFi is connected
+    if (WiFi.status() == WL_CONNECTED) {
+        initOTAOnceConnected();
+        if (otaInitialized) {
+            otaServer.handleClient();
+            ArduinoOTA.handle();
+        }
+    }
 
     // 2. Transmit activity detection -> Wakes screen and resets 15-minute standby timer
     bool isTxActive = tele.is_tx || (tele.fwd_w > 1.5f);
