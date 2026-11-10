@@ -16,14 +16,9 @@
 const char* WIFI_SSID = "Kuitunen";
 const char* WIFI_PSK  = "12345678";
 
-// Target SWR Meter Hosts (Primary direct IP + fallback mDNS/AP)
-const char* SWR_HOSTS[] = {
-    "192.168.1.159",
-    "swrmeter.local",
-    "192.168.4.1"
-};
+// Target SWR Meter Direct IP (port 2222)
+const IPAddress SWR_PRIMARY_IP(192, 168, 1, 159);
 const int SWR_PORT = 2222;
-const int SWR_HOST_COUNT = 3;
 
 // =========================================================================
 // HARDWARE SETTINGS (Guition JC4827W543C / ESP32-4827S043 4.3" IPS)
@@ -138,36 +133,66 @@ uint16_t getSwrColor(float s) {
 // BACKGROUND TELEMETRY TASK (CORE 0) - RELIABLE HTTP SOCKET POLLING
 // =========================================================================
 void telemetryTask(void *pvParameters) {
+    Serial.printf("\n[TELEMETRY] Starting WiFi connection to %s...\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.begin(WIFI_SSID, WIFI_PSK);
 
-    int hostIdx = 0;
-    int failCount = 0;
+    int connectAttempts = 0;
+    while (WiFi.status() != WL_CONNECTED && connectAttempts < 30) {
+        tele.connected = false;
+        vTaskDelay(pdMS_TO_TICKS(500));
+        Serial.print(".");
+        connectAttempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\n[TELEMETRY] WiFi Connected! IP: %s, RSSI: %d dBm\n",
+                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
 
     for (;;) {
         if (WiFi.status() != WL_CONNECTED) {
             tele.connected = false;
-            tele.rssi = 0;
-            vTaskDelay(pdMS_TO_TICKS(400));
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PSK);
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
         tele.rssi = WiFi.RSSI();
-        const char* targetHost = SWR_HOSTS[hostIdx];
+
+        IPAddress targetIP = SWR_PRIMARY_IP;
+        if (WiFi.localIP()[2] == 4) {
+            targetIP = IPAddress(192, 168, 4, 1);
+        }
 
         WiFiClient client;
-        client.setTimeout(250);
+        client.setTimeout(1200);
 
-        if (client.connect(targetHost, SWR_PORT, 250)) {
-            client.print(String("GET /data HTTP/1.1\r\nHost: ") + targetHost + "\r\nConnection: close\r\n\r\n");
+        if (client.connect(targetIP, SWR_PORT, 1000)) {
+            client.print("GET /data HTTP/1.1\r\nHost: 192.168.1.159\r\nConnection: close\r\n\r\n");
 
-            // Look directly for '{' in the incoming HTTP stream (instant, skips headers cleanly)
-            if (client.find("{")) {
-                String payload = "{" + client.readStringUntil('}') + "}";
+            // Read until closing brace '}' with 1000ms max timeout
+            String resp = "";
+            unsigned long t0 = millis();
+            while (client.connected() || client.available()) {
+                if (client.available()) {
+                    char c = (char)client.read();
+                    resp += c;
+                    if (c == '}') break; // Complete JSON received!
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                }
+                if (millis() - t0 > 1000) break;
+            }
+            client.stop();
+
+            int startIdx = resp.indexOf('{');
+            int endIdx = resp.lastIndexOf('}');
+            if (startIdx >= 0 && endIdx > startIdx) {
+                String json = resp.substring(startIdx, endIdx + 1);
                 StaticJsonDocument<512> doc;
-                DeserializationError err = deserializeJson(doc, payload);
-
+                DeserializationError err = deserializeJson(doc, json);
                 if (!err) {
                     tele.fwd_w   = doc["fwd_w"] | 0.0f;
                     tele.avg_w   = doc["avg_w"] | 0.0f;
@@ -179,19 +204,18 @@ void telemetryTask(void *pvParameters) {
                     tele.is_tx   = doc["tx"] | false;
                     tele.connected = true;
                     tele.last_seen_ms = millis();
-                    failCount = 0;
 
                     // Smart PA/RIG SWR foldback estimation
                     float fwd = tele.fwd_w;
                     float line_s = tele.swr;
                     if (fwd < 5.0f) {
                         tele.pa_swr = 1.0f;
-                    } else if (fwd >= 80.0f) {
-                        tele.pa_swr = 1.0f; // ATU matched load, full 100W+ safely dispatched
+                    } else if (fwd >= 75.0f) {
+                        tele.pa_swr = 1.0f; // ATU matched load, full power safely dispatched
                     } else if (line_s <= 1.5f) {
                         tele.pa_swr = line_s;
                     } else if (fwd >= 65.0f) {
-                        float est = 1.0f + (80.0f - fwd) / 15.0f * 0.8f;
+                        float est = 1.0f + (75.0f - fwd) / 10.0f * 0.8f;
                         tele.pa_swr = (est < line_s) ? est : line_s;
                     } else if (fwd >= 45.0f) {
                         float est = 1.8f + (65.0f - fwd) / 20.0f * 1.0f;
@@ -200,19 +224,18 @@ void telemetryTask(void *pvParameters) {
                         tele.pa_swr = line_s;
                     }
                 }
+            } else {
+                if (millis() - tele.last_seen_ms > 2500) {
+                    tele.connected = false;
+                }
             }
-            client.stop();
         } else {
-            failCount++;
-            if (failCount > 15) {
+            if (millis() - tele.last_seen_ms > 2500) {
                 tele.connected = false;
-                hostIdx = (hostIdx + 1) % SWR_HOST_COUNT;
-                failCount = 0;
             }
         }
 
-        // Fast 40ms polling (~25 updates/sec)
-        vTaskDelay(pdMS_TO_TICKS(40));
+        vTaskDelay(pdMS_TO_TICKS(40)); // ~25 updates/second
     }
 }
 
@@ -287,21 +310,15 @@ void drawSmoothSwrBar(int x, int y, int w, int h, float s) {
 void renderCleanOledTheme() {
     canvas->fillScreen(C_BLACK);
 
-    // Header bar
+    // Top Status & TX/RX
     canvas->setFont(&FreeSansBold9pt7b);
-    canvas->setTextColor(C_CYAN);
-    canvas->setCursor(14, 20);
-    canvas->print("OLED SWR MONITOR");
-
-    // RSSI & Status
-    canvas->setFont(&FreeSans9pt7b);
     if (tele.connected) {
         canvas->setTextColor(C_NEON_GREEN);
-        canvas->setCursor(220, 20);
+        canvas->setCursor(14, 20);
         canvas->printf("ONLINE (%d dBm)", tele.rssi);
     } else {
         canvas->setTextColor(C_AMBER);
-        canvas->setCursor(220, 20);
+        canvas->setCursor(14, 20);
         canvas->print("CONNECTING...");
     }
 
@@ -323,106 +340,104 @@ void renderCleanOledTheme() {
     // Horizontal divider
     canvas->drawFastHLine(10, 28, 460, C_CARD_BORDER);
 
-    // Left Column: FORWARD POWER (Vector font)
+    // -------------------------------------------------------------
+    // PRIMARY ROW: FORWARD POWER (Left) + SWR (Right)
+    // -------------------------------------------------------------
+
+    // Left Column: FORWARD POWER (x: 14 .. 225)
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_LIGHT_GRAY);
-    canvas->setCursor(16, 48);
+    canvas->setCursor(16, 50);
     canvas->print("FORWARD POWER");
 
     uint16_t pwrColor = getPwrColor(tele.fwd_w);
     canvas->setFont(&FreeSansBold24pt7b);
     canvas->setTextColor(pwrColor);
-    canvas->setCursor(14, 90);
+    canvas->setCursor(14, 96);
     canvas->printf("%5.1f", tele.fwd_w);
 
     canvas->setFont(&FreeSansBold12pt7b);
     canvas->setTextColor(C_GRAY);
-    canvas->setCursor(155, 90);
+    canvas->setCursor(158, 96);
     canvas->print("W");
 
-    // Right Column: SWR RATIO
+    // Power bar
+    drawSmoothBar(14, 114, 215, 8, tele.fwd_w, 120.0f, tele.peak_w);
+
+    // Right Columns: SWR - Separate Boxes (Never Overlap!)
+    // ANT SWR Box (x: 248 .. 350)
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_LIGHT_GRAY);
-    canvas->setCursor(250, 48);
-    canvas->print("ANTENNA SWR");
-
-    canvas->setCursor(375, 48);
-    canvas->setTextColor(C_GRAY);
-    canvas->print("PA SWR");
+    canvas->setCursor(248, 50);
+    canvas->print("ANT SWR");
 
     uint16_t swrColor = getSwrColor(tele.swr);
-    canvas->setFont(&FreeSansBold24pt7b);
+    canvas->setFont(&FreeSansBold18pt7b);
     canvas->setTextColor(swrColor);
-    canvas->setCursor(248, 90);
+    canvas->setCursor(248, 96);
     if (tele.swr > 90.0f) {
         canvas->print(">99");
     } else {
         canvas->printf("%4.2f", tele.swr);
     }
+    drawSmoothSwrBar(248, 114, 100, 8, tele.swr);
 
-    canvas->setFont(&FreeSansBold12pt7b);
-    canvas->setTextColor(C_GRAY);
-    canvas->setCursor(340, 90);
-    canvas->print(":1");
+    // PA SWR Box (x: 365 .. 465)
+    canvas->setFont(&FreeSans9pt7b);
+    canvas->setTextColor(C_LIGHT_GRAY);
+    canvas->setCursor(365, 50);
+    canvas->print("PA SWR");
 
-    // PA SWR Number
     uint16_t paColor = getSwrColor(tele.pa_swr);
     canvas->setFont(&FreeSansBold18pt7b);
     canvas->setTextColor(paColor);
-    canvas->setCursor(375, 90);
+    canvas->setCursor(365, 96);
     canvas->printf("%4.2f", tele.pa_swr);
+    drawSmoothSwrBar(365, 114, 100, 8, tele.pa_swr);
 
-    // Smooth High-Precision Progress Bars
-    drawSmoothBar(14, 108, 215, 6, tele.fwd_w, 120.0f, tele.peak_w);
-    drawSmoothSwrBar(248, 108, 218, 6, tele.swr);
+    // -------------------------------------------------------------
+    // LOWER CARD: TELEMETRY (y: 138 .. 264, h: 126)
+    // -------------------------------------------------------------
+    canvas->drawRoundRect(10, 138, 460, 124, 6, C_CARD_BORDER);
 
-    // Lower Card: Telemetry Grid (y: 130..220)
-    canvas->drawRoundRect(14, 130, 452, 90, 6, C_CARD_BORDER);
-
-    // Sub-readouts row 1
+    // Column 1: AVG (VU)
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_GRAY);
-    canvas->setCursor(26, 155);
-    canvas->print("AVG (VU) POWER");
-    canvas->setCursor(26, 175);
+    canvas->setCursor(24, 168);
+    canvas->print("AVG (VU)");
+    canvas->setCursor(24, 198);
     canvas->setTextColor(C_WHITE);
     canvas->setFont(&FreeSansBold12pt7b);
     canvas->printf("%5.1f W", tele.avg_w);
 
+    // Column 2: PEP PEAK
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_GRAY);
-    canvas->setCursor(175, 155);
-    canvas->print("PEAK HOLD (PEP)");
-    canvas->setCursor(175, 175);
+    canvas->setCursor(175, 168);
+    canvas->print("PEP PEAK");
+    canvas->setCursor(175, 198);
     canvas->setTextColor(C_AMBER);
     canvas->setFont(&FreeSansBold12pt7b);
     canvas->printf("%5.1f W", tele.peak_w);
 
+    // Column 3: REFLECTED POWER
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_GRAY);
-    canvas->setCursor(325, 155);
+    canvas->setCursor(325, 168);
     canvas->print("REFLECTED");
-    canvas->setCursor(325, 175);
+    canvas->setCursor(325, 198);
     canvas->setTextColor(C_BRIGHT_RED);
     canvas->setFont(&FreeSansBold12pt7b);
     canvas->printf("%5.2f W", tele.rev_w);
 
-    // Detector Voltages row 2
+    // Horizontal divider inside lower card
+    canvas->drawFastHLine(20, 218, 440, C_CARD_BORDER);
+
+    // Detector voltages row (No extra footer or tap text!)
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_GRAY);
-    canvas->setCursor(26, 205);
-    canvas->printf("DETECTORS:  FWD: %4.2f V    REV: %4.2f V", tele.fwd_v, tele.rev_v);
-
-    canvas->setCursor(330, 205);
-    canvas->setTextColor(C_CYAN);
-    canvas->print("TAP TO CHANGE");
-
-    // Bottom info line
-    canvas->drawFastHLine(10, 238, 460, C_CARD_BORDER);
-    canvas->setFont(&FreeSans9pt7b);
-    canvas->setTextColor(C_GRAY);
-    canvas->setCursor(14, 258);
-    canvas->print("ESP32-S3 HIGH SPEED SWR & POWER MONITOR");
+    canvas->setCursor(24, 246);
+    canvas->printf("DETECTORS:   FWD: %4.2f V       REV: %4.2f V", tele.fwd_v, tele.rev_v);
 }
 
 // =========================================================================
@@ -436,14 +451,9 @@ void renderModernTheme() {
     canvas->drawFastHLine(0, 26, 480, C_CARD_BORDER);
 
     canvas->setFont(&FreeSansBold9pt7b);
-    canvas->setTextColor(C_CYAN);
-    canvas->setCursor(12, 18);
-    canvas->print("MODERN DASHBOARD");
-
-    canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(tele.connected ? C_NEON_GREEN : C_AMBER);
-    canvas->setCursor(200, 18);
-    canvas->printf("WIFI %d dBm", tele.rssi);
+    canvas->setCursor(14, 18);
+    canvas->printf("ONLINE (%d dBm)", tele.rssi);
 
     // TX/RX
     canvas->setCursor(410, 18);
@@ -675,12 +685,6 @@ void renderCrossNeedleTheme() {
     canvas->setCursor(350, 28);
     canvas->print("REFLECTED");
 
-    // Title
-    canvas->setFont(&FreeSansBold9pt7b);
-    canvas->setTextColor(C_CYAN);
-    canvas->setCursor(185, 24);
-    canvas->print("CROSS-NEEDLE");
-
     // Mechanical Needle Inertial Damping
     float targetFwd = tele.fwd_w;
     float targetRev = tele.rev_w;
@@ -766,11 +770,7 @@ void renderRetroAmberTheme() {
     canvas->setFont(&FreeSansBold9pt7b);
     canvas->setTextColor(C_AMBER);
     canvas->setCursor(16, 20);
-    canvas->print("RETRO CRT PHOSPHOR");
-
-    canvas->setFont(&FreeSans9pt7b);
-    canvas->setCursor(220, 20);
-    canvas->printf("RSSI: %d dBm", tele.rssi);
+    canvas->printf("ONLINE (%d dBm)", tele.rssi);
 
     canvas->setCursor(410, 20);
     canvas->print(tele.is_tx ? "[TX ON]" : "[RX]");
@@ -851,7 +851,7 @@ void setup() {
 
     canvas->setTextColor(C_GRAY);
     canvas->setCursor(60, 160);
-    canvas->printf("Target: %s:%d", SWR_HOSTS[0], SWR_PORT);
+    canvas->printf("Target: %s:%d", SWR_PRIMARY_IP.toString().c_str(), SWR_PORT);
 
     canvas->flush();
 
