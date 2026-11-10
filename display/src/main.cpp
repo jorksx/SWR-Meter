@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Update.h>
@@ -21,9 +20,9 @@
 // CONFIGURATION & PERSISTENT NVS STORAGE (Preferences)
 // =========================================================================
 Preferences prefs;
-String wifi_ssid   = "Kuitunen";
-String wifi_psk    = "12345678";
-String bridge_ip   = "192.168.1.159";
+String wifi_ssid     = "Kuitunen";
+String wifi_psk      = "12345678";
+String bridge_ip     = "192.168.1.159";
 uint16_t bridge_port = 2222;
 
 void loadConfig() {
@@ -290,7 +289,6 @@ unsigned long lastTouchTime = 0;
 
 // Forward declarations
 void startSetupAP();
-void stopSetupAP();
 void setupWebServerRoutes();
 String getIndexHtml();
 
@@ -313,124 +311,110 @@ uint16_t getSwrColor(float s) {
 }
 
 // =========================================================================
-// BACKGROUND TELEMETRY TASK (CORE 0) - DIRECT WIFICLIENT (HIGH SPEED & STABLE)
+// DIRECT SOCKET SWR TELEMETRY FETCH
+// =========================================================================
+bool fetchTelemetryFromBridge(const char* host, uint16_t port) {
+    WiFiClient client;
+    client.setTimeout(400); // 400ms timeout
+
+    if (!client.connect(host, port)) {
+        return false;
+    }
+
+    client.print(F("GET /data HTTP/1.1\r\nHost: swrmeter\r\nConnection: close\r\n\r\n"));
+
+    unsigned long startMs = millis();
+    String response = "";
+    response.reserve(1024);
+
+    // Read full response until connection closes or 500ms timeout
+    while ((client.connected() || client.available() > 0) && (millis() - startMs < 500)) {
+        while (client.available() > 0) {
+            char c = (char)client.read();
+            response += c;
+        }
+        vTaskDelay(pdMS_TO_TICKS(4));
+    }
+    client.stop();
+
+    if (response.length() == 0) return false;
+
+    // Split headers and body at \r\n\r\n
+    int bodyIdx = response.indexOf("\r\n\r\n");
+    if (bodyIdx < 0) return false;
+
+    String json = response.substring(bodyIdx + 4);
+    json.trim();
+    if (json.length() == 0) return false;
+
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, json);
+    if (err) return false;
+
+    tele.fwd_w   = doc["fwd_w"] | 0.0f;
+    tele.avg_w   = doc["avg_w"] | 0.0f;
+    tele.peak_w  = doc["peak_w"] | 0.0f;
+    tele.rev_w   = doc["rev_w"] | 0.0f;
+    tele.swr     = doc["swr"] | 1.0f;
+    tele.fwd_v   = doc["fwd_v"] | 0.0f;
+    tele.rev_v   = doc["rev_v"] | 0.0f;
+    tele.is_tx   = doc["tx"] | false;
+    tele.connected = true;
+    tele.last_seen_ms = millis();
+
+    // Smart PA/RIG SWR foldback estimation
+    float fwd = tele.fwd_w;
+    float line_s = tele.swr;
+    if (fwd < 5.0f) {
+        tele.pa_swr = 1.0f;
+    } else if (fwd >= 75.0f) {
+        tele.pa_swr = 1.0f;
+    } else if (line_s <= 1.5f) {
+        tele.pa_swr = line_s;
+    } else if (fwd >= 65.0f) {
+        float est = 1.0f + (75.0f - fwd) / 10.0f * 0.8f;
+        tele.pa_swr = (est < line_s) ? est : line_s;
+    } else if (fwd >= 45.0f) {
+        float est = 1.8f + (65.0f - fwd) / 20.0f * 1.0f;
+        tele.pa_swr = (est < line_s) ? est : line_s;
+    } else {
+        tele.pa_swr = line_s;
+    }
+
+    return true;
+}
+
+// =========================================================================
+// BACKGROUND TELEMETRY TASK (CORE 0)
 // =========================================================================
 void telemetryTask(void *pvParameters) {
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-
-    Serial.printf("\n[TELEMETRY] Connecting WiFi: %s...\n", wifi_ssid.c_str());
-    WiFi.begin(wifi_ssid.c_str(), wifi_psk.c_str());
-    unsigned long wifiConnectStartMs = millis();
-
     for (;;) {
-        // 1. Check WiFi Connection and valid IP address
-        if (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+        // If WiFi is disconnected and AP mode is not active:
+        if (WiFi.status() != WL_CONNECTED && !apModeActive) {
             tele.connected = false;
+            snprintf(dbgStatus, sizeof(dbgStatus), "WIFI: %s...", wifi_ssid.c_str());
+            vTaskDelay(pdMS_TO_TICKS(400));
+            continue;
+        }
 
-            // If WiFi fails to connect for 20 seconds, start open Setup AP
-            if ((millis() - wifiConnectStartMs > 20000) && !apModeActive) {
-                startSetupAP();
-            }
-
-            if (apModeActive) {
-                snprintf(dbgStatus, sizeof(dbgStatus), "AP: SWR-Display-Setup");
-            } else {
-                snprintf(dbgStatus, sizeof(dbgStatus), "WIFI: %s...", wifi_ssid.c_str());
-            }
-
+        if (apModeActive) {
+            snprintf(dbgStatus, sizeof(dbgStatus), "AP: SWR-Display-Setup");
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
-        // WiFi IS connected!
-        if (apModeActive && WiFi.softAPgetStationNum() == 0) {
-            stopSetupAP();
-        }
-
-        wifiConnectStartMs = millis();
         tele.rssi = WiFi.RSSI();
 
-        // 2. Poll SWR Bridge via Direct WiFiClient
-        // We test primary configured target (bridge_ip:bridge_port), and fallback to swrmeter.local:2222
-        bool gotData = false;
-        const char* targets[2] = { bridge_ip.c_str(), "swrmeter.local" };
-        uint16_t ports[2] = { bridge_port, 2222 };
-
-        for (int t = 0; t < 2; t++) {
-            const char* host = targets[t];
-            uint16_t port = ports[t];
-
-            WiFiClient client;
-            client.setTimeout(400); // 400ms timeout
-            if (client.connect(host, port)) {
-                client.print(F("GET /data HTTP/1.1\r\nHost: swrmeter\r\nConnection: close\r\n\r\n"));
-
-                unsigned long startMs = millis();
-                while (client.connected() && client.available() == 0 && (millis() - startMs < 500)) {
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                }
-
-                if (client.available() > 0) {
-                    String statusLine = client.readStringUntil('\n');
-                    if (statusLine.indexOf("200") >= 0) {
-                        // Skip HTTP headers until empty line
-                        while (client.connected() || client.available() > 0) {
-                            String h = client.readStringUntil('\n');
-                            h.trim();
-                            if (h.length() == 0) break;
-                            if (millis() - startMs > 700) break;
-                        }
-
-                        // Read JSON body
-                        String jsonPayload = client.readStringUntil('\n');
-                        jsonPayload.trim();
-                        if (jsonPayload.length() > 0) {
-                            StaticJsonDocument<512> doc;
-                            DeserializationError err = deserializeJson(doc, jsonPayload);
-                            if (!err) {
-                                tele.fwd_w   = doc["fwd_w"] | 0.0f;
-                                tele.avg_w   = doc["avg_w"] | 0.0f;
-                                tele.peak_w  = doc["peak_w"] | 0.0f;
-                                tele.rev_w   = doc["rev_w"] | 0.0f;
-                                tele.swr     = doc["swr"] | 1.0f;
-                                tele.fwd_v   = doc["fwd_v"] | 0.0f;
-                                tele.rev_v   = doc["rev_v"] | 0.0f;
-                                tele.is_tx   = doc["tx"] | false;
-                                tele.connected = true;
-                                tele.last_seen_ms = millis();
-                                gotData = true;
-
-                                // Smart PA/RIG SWR foldback estimation
-                                float fwd = tele.fwd_w;
-                                float line_s = tele.swr;
-                                if (fwd < 5.0f) {
-                                    tele.pa_swr = 1.0f;
-                                } else if (fwd >= 75.0f) {
-                                    tele.pa_swr = 1.0f;
-                                } else if (line_s <= 1.5f) {
-                                    tele.pa_swr = line_s;
-                                } else if (fwd >= 65.0f) {
-                                    float est = 1.0f + (75.0f - fwd) / 10.0f * 0.8f;
-                                    tele.pa_swr = (est < line_s) ? est : line_s;
-                                } else if (fwd >= 45.0f) {
-                                    float est = 1.8f + (65.0f - fwd) / 20.0f * 1.0f;
-                                    tele.pa_swr = (est < line_s) ? est : line_s;
-                                } else {
-                                    tele.pa_swr = line_s;
-                                }
-                                snprintf(dbgStatus, sizeof(dbgStatus), "ONLINE (%d dBm)", tele.rssi);
-                            }
-                        }
-                    }
-                }
-                client.stop();
-            }
-
-            if (gotData) break;
+        // Try primary configured target (bridge_ip), and fallback to swrmeter.local
+        bool success = fetchTelemetryFromBridge(bridge_ip.c_str(), bridge_port);
+        if (!success && bridge_ip != "swrmeter.local") {
+            success = fetchTelemetryFromBridge("swrmeter.local", 2222);
         }
 
-        if (!gotData) {
+        if (success) {
+            snprintf(dbgStatus, sizeof(dbgStatus), "ONLINE (%d dBm)", tele.rssi);
+            vTaskDelay(pdMS_TO_TICKS(40));
+        } else {
             tele.connected = false;
             tele.fwd_w  = 0.0f;
             tele.avg_w  = 0.0f;
@@ -440,9 +424,7 @@ void telemetryTask(void *pvParameters) {
             tele.pa_swr = 1.0f;
             tele.is_tx  = false;
             snprintf(dbgStatus, sizeof(dbgStatus), "SWR BRIDGE OFFLINE");
-            vTaskDelay(pdMS_TO_TICKS(400));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(350));
         }
     }
 }
@@ -1161,16 +1143,6 @@ void startSetupAP() {
     Serial.println("[AP] Setup AP running at 192.168.4.1 (DNS port 53 active)");
 }
 
-void stopSetupAP() {
-    if (!apModeActive) return;
-    Serial.println("[AP] Stopping Setup AP...");
-    dnsServer.stop();
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    apModeActive = false;
-    Serial.println("[AP] Setup AP stopped, back to STA mode.");
-}
-
 // =========================================================================
 // OTA & MDNS INITIALIZATION (CALLED ONCE WIFI STA IS CONNECTED)
 // =========================================================================
@@ -1214,7 +1186,7 @@ void setup() {
     canvas->begin();
     canvas->fillScreen(C_BLACK);
 
-    // Initial Splash Screen (Smooth fonts)
+    // Initial Splash Screen
     canvas->setFont(&FreeSansBold12pt7b);
     canvas->setTextColor(C_CYAN);
     canvas->setCursor(60, 90);
@@ -1228,14 +1200,34 @@ void setup() {
     canvas->setTextColor(C_GRAY);
     canvas->setCursor(60, 160);
     canvas->printf("Target: http://%s:%u/data", bridge_ip.c_str(), bridge_port);
-
     canvas->flush();
 
     // 3. Initialize Capacitive Touch
     tp.begin();
     tp.setRotation(ROTATION_NORMAL);
 
-    // 4. Start Background Telemetry Task on Core 0
+    // 4. Connect to WiFi directly here in setup() (Fast 2-3 sec connection!)
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.setSleep(false);
+    Serial.printf("[WIFI] Connecting to %s...\n", wifi_ssid.c_str());
+    WiFi.begin(wifi_ssid.c_str(), wifi_psk.c_str());
+
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 25) {
+        delay(200);
+        retries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("[WIFI] Connection failed, starting Setup AP...");
+        startSetupAP();
+    }
+
+    // 5. Start Background Telemetry Task on Core 0
     xTaskCreatePinnedToCore(
         telemetryTask,
         "TelemetryTask",
@@ -1248,8 +1240,6 @@ void setup() {
 
     lastActivityTime = millis();
     isBacklightOn = true;
-
-    delay(400);
 }
 
 // =========================================================================
