@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
 #include <TAMC_GT911.h>
@@ -28,6 +32,111 @@ const NetTarget NET_TARGETS[] = {
 const int NET_TARGET_COUNT = 2;
 
 char dbgStatus[64] = "CONNECTING...";
+
+// Web OTA Server on Port 80
+WebServer otaServer(80);
+
+// =========================================================================
+// STANDBY TIMEOUT (15 MINUTES INACTIVITY -> SCREEN OFF, TX / TOUCH WAKES UP)
+// =========================================================================
+const unsigned long STANDBY_TIMEOUT_MS = 15UL * 60UL * 1000UL; // 15 min = 900,000 ms
+unsigned long lastActivityTime = 0;
+bool isBacklightOn = true;
+
+// Clean Dark Mode OTA Web Interface
+const char OTA_INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SWR Näyttö - OTA Päivitys</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+body { background: #080c14; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; }
+.card { background: #121824; border: 1px solid #202838; border-radius: 12px; padding: 2rem; max-width: 440px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.6); }
+h1 { font-size: 1.35rem; color: #00e5ff; margin-bottom: 0.4rem; font-weight: 700; text-align: center; }
+p.sub { font-size: 0.85rem; color: #9aaabb; margin-bottom: 1.5rem; text-align: center; }
+.info-box { background: #080c14; border: 1px solid #1a2334; border-radius: 8px; padding: 0.8rem; margin-bottom: 1.5rem; font-size: 0.82rem; color: #00ff88; line-height: 1.6; }
+.info-row { display: flex; justify-content: space-between; }
+.info-label { color: #62728d; }
+input[type=file] { display: block; width: 100%; background: #182030; border: 1px solid #243048; padding: 0.75rem; border-radius: 8px; color: #fff; margin-bottom: 1.2rem; cursor: pointer; }
+button { background: #00e5ff; color: #080c14; border: none; font-weight: 700; padding: 0.85rem; border-radius: 8px; cursor: pointer; width: 100%; font-size: 1rem; transition: background 0.2s; }
+button:hover { background: #00ff88; }
+button:disabled { background: #2a3548; color: #62728d; cursor: not-allowed; }
+#progress-wrap { display: none; margin-top: 1.2rem; }
+.bar-bg { background: #080c14; border: 1px solid #243048; border-radius: 6px; height: 16px; overflow: hidden; }
+.bar-fill { background: linear-gradient(90deg, #00e5ff, #00ff88); width: 0%; height: 100%; transition: width 0.1s; }
+#status-txt { margin-top: 0.6rem; font-size: 0.85rem; color: #00e5ff; text-align: center; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>ESP32-S3 SWR N&auml;ytt&ouml;</h1>
+  <p class="sub">Langaton laiteohjelmiston p&auml;ivitys (OTA)</p>
+  <div class="info-box">
+    <div class="info-row"><span class="info-label">Laite:</span><span>4.3" NV3041A IPS</span></div>
+    <div class="info-row"><span class="info-label">Standby-tila:</span><span>15 min automaatti (TX her&auml;tt&auml;&auml;)</span></div>
+    <div class="info-row"><span class="info-label">Osoite:</span><span>swrdisplay.local</span></div>
+  </div>
+  <form id="upload-form">
+    <input type="file" id="file" name="update" accept=".bin" required>
+    <button type="submit" id="btn">🚀 Asenna uusi .bin ohjelmisto</button>
+  </form>
+  <div id="progress-wrap">
+    <div class="bar-bg"><div class="bar-fill" id="bar"></div></div>
+    <div id="status-txt">Ladataan: 0%</div>
+  </div>
+</div>
+<script>
+document.getElementById('upload-form').onsubmit = function(e) {
+  e.preventDefault();
+  var fileInput = document.getElementById('file');
+  if (!fileInput.files.length) return;
+  var file = fileInput.files[0];
+  var btn = document.getElementById('btn');
+  var pWrap = document.getElementById('progress-wrap');
+  var bar = document.getElementById('bar');
+  var txt = document.getElementById('status-txt');
+
+  btn.disabled = true;
+  pWrap.style.display = 'block';
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/update', true);
+
+  xhr.upload.onprogress = function(pe) {
+    if (pe.lengthComputable) {
+      var pct = Math.round((pe.loaded / pe.total) * 100);
+      bar.style.width = pct + '%';
+      txt.textContent = 'Siirret&auml;&auml;n: ' + pct + '%...';
+    }
+  };
+
+  xhr.onload = function() {
+    if (xhr.status === 200) {
+      bar.style.width = '100%';
+      txt.innerHTML = '&#9989; P&auml;ivitys onnistui! N&auml;ytt&ouml; k&auml;ynnistyy uudelleen...';
+      setTimeout(function() { location.href = '/'; }, 5000);
+    } else {
+      txt.innerHTML = '&#10060; Virhe: ' + xhr.responseText;
+      btn.disabled = false;
+    }
+  };
+
+  xhr.onerror = function() {
+    txt.innerHTML = '&#10060; Yhteysvirhe siirron aikana.';
+    btn.disabled = false;
+  };
+
+  var formData = new FormData();
+  formData.append('update', file);
+  xhr.send(formData);
+};
+</script>
+</body>
+</html>
+)rawliteral";
 
 // =========================================================================
 // HARDWARE SETTINGS (Guition JC4827W543C / ESP32-4827S043 4.3" IPS)
@@ -168,6 +277,16 @@ void telemetryTask(void *pvParameters) {
             }
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
+        }
+
+        // Initialize mDNS hostname when WiFi connects
+        static bool mdnsInitialized = false;
+        if (!mdnsInitialized && WiFi.status() == WL_CONNECTED) {
+            if (MDNS.begin("swrdisplay")) {
+                MDNS.addService("http", "tcp", 80);
+                mdnsInitialized = true;
+                Serial.printf("[MDNS] Active: http://swrdisplay.local (IP: %s)\n", WiFi.localIP().toString().c_str());
+            }
         }
 
         tele.rssi = WiFi.RSSI();
@@ -865,6 +984,46 @@ void setup() {
         0 // Core 0
     );
 
+    // 5. Initialize Web OTA Server (Port 80)
+    otaServer.on("/", HTTP_GET, []() {
+        otaServer.sendHeader("Connection", "close");
+        otaServer.send_P(200, "text/html", OTA_INDEX_HTML);
+    });
+
+    otaServer.on("/update", HTTP_POST, []() {
+        otaServer.sendHeader("Connection", "close");
+        otaServer.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+        delay(250);
+        ESP.restart();
+    }, []() {
+        HTTPUpload& upload = otaServer.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            Serial.printf("[OTA] Update Start: %s\n", upload.filename.c_str());
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (Update.end(true)) {
+                Serial.printf("[OTA] Update Success: %u bytes\n", upload.totalSize);
+            } else {
+                Update.printError(Serial);
+            }
+        }
+    });
+
+    otaServer.begin();
+
+    // 6. Initialize ArduinoOTA (Port 3232)
+    ArduinoOTA.setHostname("swrdisplay");
+    ArduinoOTA.begin();
+
+    lastActivityTime = millis();
+    isBacklightOn = true;
+
     delay(600);
 }
 
@@ -874,31 +1033,67 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // 1. Process Touch Input (Switch Themes)
+    // 1. Handle OTA requests (Web OTA on port 80 & ArduinoOTA on port 3232)
+    otaServer.handleClient();
+    ArduinoOTA.handle();
+
+    // 2. Transmit activity detection -> Wakes screen and resets 15-minute standby timer
+    bool isTxActive = tele.is_tx || (tele.fwd_w > 1.5f);
+    if (isTxActive) {
+        if (!isBacklightOn) {
+            digitalWrite(GFX_BL, HIGH);
+            isBacklightOn = true;
+            Serial.println("[STANDBY] TX active -> Screen woke up!");
+        }
+        lastActivityTime = now;
+    }
+
+    // 3. Process Touch Input (Wake screen or cycle themes)
     tp.read();
-    if (tp.isTouched && (now - lastTouchTime > 400)) {
+    if (tp.isTouched && (now - lastTouchTime > 350)) {
         lastTouchTime = now;
-        currentTheme = (DisplayTheme)((currentTheme + 1) % THEME_COUNT);
+        lastActivityTime = now;
+
+        if (!isBacklightOn) {
+            // First tap wakes up the screen
+            digitalWrite(GFX_BL, HIGH);
+            isBacklightOn = true;
+            Serial.println("[STANDBY] Screen tapped -> Screen woke up!");
+        } else {
+            // Screen is awake -> cycle through themes
+            currentTheme = (DisplayTheme)((currentTheme + 1) % THEME_COUNT);
+        }
     }
 
-    // 2. Render Active Theme into PSRAM Canvas
-    switch (currentTheme) {
-        case THEME_CLEAN_OLED:
-            renderCleanOledTheme();
-            break;
-        case THEME_MODERN:
-            renderModernTheme();
-            break;
-        case THEME_CROSS_NEEDLE:
-            renderCrossNeedleTheme();
-            break;
-        case THEME_AMBER_RIG:
-            renderRetroAmberTheme();
-            break;
+    // 4. Standby timeout check (15 minutes of inactivity)
+    if (isBacklightOn && (now - lastActivityTime >= STANDBY_TIMEOUT_MS)) {
+        digitalWrite(GFX_BL, LOW);
+        isBacklightOn = false;
+        Serial.println("[STANDBY] 15min inactivity reached -> Backlight turned OFF");
     }
 
-    // 3. Instant Tear-Free Blit to Display!
-    canvas->flush();
+    // 5. Render Active Theme into PSRAM Canvas
+    if (isBacklightOn) {
+        switch (currentTheme) {
+            case THEME_CLEAN_OLED:
+                renderCleanOledTheme();
+                break;
+            case THEME_MODERN:
+                renderModernTheme();
+                break;
+            case THEME_CROSS_NEEDLE:
+                renderCrossNeedleTheme();
+                break;
+            case THEME_AMBER_RIG:
+                renderRetroAmberTheme();
+                break;
+        }
 
-    delay(25);
+        // Instant Tear-Free Blit to Display!
+        canvas->flush();
+        delay(25);
+    } else {
+        // In standby: save CPU and power, but keep loop alive for OTA & telemetry polling
+        delay(80);
+    }
 }
