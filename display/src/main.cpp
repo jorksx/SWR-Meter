@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
 #include <TAMC_GT911.h>
@@ -13,12 +14,20 @@
 // =========================================================================
 // WIFI & TARGET SWR METER CONFIGURATION
 // =========================================================================
-const char* WIFI_SSID = "Kuitunen";
-const char* WIFI_PSK  = "12345678";
+struct NetTarget {
+    const char* ssid;
+    const char* psk;
+    const char* url;
+};
 
-// Target SWR Meter Direct IP (port 2222)
-const IPAddress SWR_PRIMARY_IP(192, 168, 1, 159);
-const int SWR_PORT = 2222;
+// Dual-target: Primary home network, fallback direct to SWR-Meter-AP!
+const NetTarget NET_TARGETS[] = {
+    { "Kuitunen",      "12345678", "http://192.168.1.159:2222/data" },
+    { "SWR-Meter-AP",  "12345678", "http://192.168.4.1:2222/data"   }
+};
+const int NET_TARGET_COUNT = 2;
+
+char dbgStatus[64] = "CONNECTING...";
 
 // =========================================================================
 // HARDWARE SETTINGS (Guition JC4827W543C / ESP32-4827S043 4.3" IPS)
@@ -130,112 +139,104 @@ uint16_t getSwrColor(float s) {
 }
 
 // =========================================================================
-// BACKGROUND TELEMETRY TASK (CORE 0) - RELIABLE HTTP SOCKET POLLING
+// BACKGROUND TELEMETRY TASK (CORE 0) - DUAL TARGET (KUITUNEN & SWR-METER-AP)
 // =========================================================================
 void telemetryTask(void *pvParameters) {
-    Serial.printf("\n[TELEMETRY] Starting WiFi connection to %s...\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    WiFi.begin(WIFI_SSID, WIFI_PSK);
 
-    int connectAttempts = 0;
-    while (WiFi.status() != WL_CONNECTED && connectAttempts < 30) {
-        tele.connected = false;
-        vTaskDelay(pdMS_TO_TICKS(500));
-        Serial.print(".");
-        connectAttempts++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[TELEMETRY] WiFi Connected! IP: %s, RSSI: %d dBm\n",
-                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    }
+    int curIdx = 0;
+    int failCount = 0;
+
+    Serial.printf("\n[TELEMETRY] Connecting WiFi: %s...\n", NET_TARGETS[curIdx].ssid);
+    WiFi.begin(NET_TARGETS[curIdx].ssid, NET_TARGETS[curIdx].psk);
 
     for (;;) {
+        // Handle WiFi connection
         if (WiFi.status() != WL_CONNECTED) {
             tele.connected = false;
-            WiFi.disconnect();
-            WiFi.begin(WIFI_SSID, WIFI_PSK);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            failCount++;
+            snprintf(dbgStatus, sizeof(dbgStatus), "WIFI: %s...", NET_TARGETS[curIdx].ssid);
+
+            if (failCount > 15) {
+                // Switch between Home Wi-Fi (Kuitunen) and Purkki Direct AP (SWR-Meter-AP)
+                curIdx = (curIdx + 1) % NET_TARGET_COUNT;
+                failCount = 0;
+                Serial.printf("[TELEMETRY] Switching to %s...\n", NET_TARGETS[curIdx].ssid);
+                WiFi.disconnect();
+                WiFi.begin(NET_TARGETS[curIdx].ssid, NET_TARGETS[curIdx].psk);
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
         tele.rssi = WiFi.RSSI();
+        const char* targetUrl = NET_TARGETS[curIdx].url;
 
-        IPAddress targetIP = SWR_PRIMARY_IP;
-        if (WiFi.localIP()[2] == 4) {
-            targetIP = IPAddress(192, 168, 4, 1);
-        }
+        HTTPClient http;
+        http.begin(targetUrl);
+        http.setTimeout(800); // 800ms timeout
+        int httpCode = http.GET();
 
-        WiFiClient client;
-        client.setTimeout(1200);
+        if (httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            StaticJsonDocument<512> doc;
+            DeserializationError err = deserializeJson(doc, payload);
 
-        if (client.connect(targetIP, SWR_PORT, 1000)) {
-            client.print("GET /data HTTP/1.1\r\nHost: 192.168.1.159\r\nConnection: close\r\n\r\n");
+            if (!err) {
+                tele.fwd_w   = doc["fwd_w"] | 0.0f;
+                tele.avg_w   = doc["avg_w"] | 0.0f;
+                tele.peak_w  = doc["peak_w"] | 0.0f;
+                tele.rev_w   = doc["rev_w"] | 0.0f;
+                tele.swr     = doc["swr"] | 1.0f;
+                tele.fwd_v   = doc["fwd_v"] | 0.0f;
+                tele.rev_v   = doc["rev_v"] | 0.0f;
+                tele.is_tx   = doc["tx"] | false;
+                tele.connected = true;
+                tele.last_seen_ms = millis();
+                failCount = 0;
 
-            // Read until closing brace '}' with 1000ms max timeout
-            String resp = "";
-            unsigned long t0 = millis();
-            while (client.connected() || client.available()) {
-                if (client.available()) {
-                    char c = (char)client.read();
-                    resp += c;
-                    if (c == '}') break; // Complete JSON received!
+                // Smart PA/RIG SWR foldback estimation
+                float fwd = tele.fwd_w;
+                float line_s = tele.swr;
+                if (fwd < 5.0f) {
+                    tele.pa_swr = 1.0f;
+                } else if (fwd >= 75.0f) {
+                    tele.pa_swr = 1.0f; // ATU matched load, full power safely dispatched
+                } else if (line_s <= 1.5f) {
+                    tele.pa_swr = line_s;
+                } else if (fwd >= 65.0f) {
+                    float est = 1.0f + (75.0f - fwd) / 10.0f * 0.8f;
+                    tele.pa_swr = (est < line_s) ? est : line_s;
+                } else if (fwd >= 45.0f) {
+                    float est = 1.8f + (65.0f - fwd) / 20.0f * 1.0f;
+                    tele.pa_swr = (est < line_s) ? est : line_s;
                 } else {
-                    vTaskDelay(pdMS_TO_TICKS(2));
+                    tele.pa_swr = line_s;
                 }
-                if (millis() - t0 > 1000) break;
-            }
-            client.stop();
-
-            int startIdx = resp.indexOf('{');
-            int endIdx = resp.lastIndexOf('}');
-            if (startIdx >= 0 && endIdx > startIdx) {
-                String json = resp.substring(startIdx, endIdx + 1);
-                StaticJsonDocument<512> doc;
-                DeserializationError err = deserializeJson(doc, json);
-                if (!err) {
-                    tele.fwd_w   = doc["fwd_w"] | 0.0f;
-                    tele.avg_w   = doc["avg_w"] | 0.0f;
-                    tele.peak_w  = doc["peak_w"] | 0.0f;
-                    tele.rev_w   = doc["rev_w"] | 0.0f;
-                    tele.swr     = doc["swr"] | 1.0f;
-                    tele.fwd_v   = doc["fwd_v"] | 0.0f;
-                    tele.rev_v   = doc["rev_v"] | 0.0f;
-                    tele.is_tx   = doc["tx"] | false;
-                    tele.connected = true;
-                    tele.last_seen_ms = millis();
-
-                    // Smart PA/RIG SWR foldback estimation
-                    float fwd = tele.fwd_w;
-                    float line_s = tele.swr;
-                    if (fwd < 5.0f) {
-                        tele.pa_swr = 1.0f;
-                    } else if (fwd >= 75.0f) {
-                        tele.pa_swr = 1.0f; // ATU matched load, full power safely dispatched
-                    } else if (line_s <= 1.5f) {
-                        tele.pa_swr = line_s;
-                    } else if (fwd >= 65.0f) {
-                        float est = 1.0f + (75.0f - fwd) / 10.0f * 0.8f;
-                        tele.pa_swr = (est < line_s) ? est : line_s;
-                    } else if (fwd >= 45.0f) {
-                        float est = 1.8f + (65.0f - fwd) / 20.0f * 1.0f;
-                        tele.pa_swr = (est < line_s) ? est : line_s;
-                    } else {
-                        tele.pa_swr = line_s;
-                    }
-                }
-            } else {
-                if (millis() - tele.last_seen_ms > 2500) {
-                    tele.connected = false;
-                }
+                snprintf(dbgStatus, sizeof(dbgStatus), "ONLINE (%d dBm)", tele.rssi);
             }
         } else {
-            if (millis() - tele.last_seen_ms > 2500) {
+            failCount++;
+            if (millis() - tele.last_seen_ms > 2000) {
                 tele.connected = false;
             }
-        }
+            snprintf(dbgStatus, sizeof(dbgStatus), "%s: ERR %d", NET_TARGETS[curIdx].ssid, httpCode);
 
-        vTaskDelay(pdMS_TO_TICKS(40)); // ~25 updates/second
+            // If 6 consecutive HTTP failures (e.g. router AP isolation blocks client-to-client):
+            // Switch network immediately!
+            if (failCount > 6) {
+                curIdx = (curIdx + 1) % NET_TARGET_COUNT;
+                failCount = 0;
+                Serial.printf("[TELEMETRY] HTTP failstreak -> Switching to %s...\n", NET_TARGETS[curIdx].ssid);
+                WiFi.disconnect();
+                WiFi.begin(NET_TARGETS[curIdx].ssid, NET_TARGETS[curIdx].psk);
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+        }
+        http.end();
+
+        vTaskDelay(pdMS_TO_TICKS(40));
     }
 }
 
@@ -312,15 +313,9 @@ void renderCleanOledTheme() {
 
     // Top Status & TX/RX
     canvas->setFont(&FreeSansBold9pt7b);
-    if (tele.connected) {
-        canvas->setTextColor(C_NEON_GREEN);
-        canvas->setCursor(14, 20);
-        canvas->printf("ONLINE (%d dBm)", tele.rssi);
-    } else {
-        canvas->setTextColor(C_AMBER);
-        canvas->setCursor(14, 20);
-        canvas->print("CONNECTING...");
-    }
+    canvas->setTextColor(tele.connected ? C_NEON_GREEN : C_AMBER);
+    canvas->setCursor(14, 20);
+    canvas->print(dbgStatus);
 
     // TX/RX Badge
     if (tele.is_tx) {
@@ -453,7 +448,7 @@ void renderModernTheme() {
     canvas->setFont(&FreeSansBold9pt7b);
     canvas->setTextColor(tele.connected ? C_NEON_GREEN : C_AMBER);
     canvas->setCursor(14, 18);
-    canvas->printf("ONLINE (%d dBm)", tele.rssi);
+    canvas->print(dbgStatus);
 
     // TX/RX
     canvas->setCursor(410, 18);
@@ -768,9 +763,9 @@ void renderRetroAmberTheme() {
     canvas->drawFastHLine(6, 26, 468, C_AMBER);
 
     canvas->setFont(&FreeSansBold9pt7b);
-    canvas->setTextColor(C_AMBER);
+    canvas->setTextColor(tele.connected ? C_AMBER : 0xFD20);
     canvas->setCursor(16, 20);
-    canvas->printf("ONLINE (%d dBm)", tele.rssi);
+    canvas->print(dbgStatus);
 
     canvas->setCursor(410, 20);
     canvas->print(tele.is_tx ? "[TX ON]" : "[RX]");
@@ -847,11 +842,11 @@ void setup() {
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_WHITE);
     canvas->setCursor(60, 130);
-    canvas->printf("Connecting WiFi: %s...", WIFI_SSID);
+    canvas->printf("Connecting WiFi: %s...", NET_TARGETS[0].ssid);
 
     canvas->setTextColor(C_GRAY);
     canvas->setCursor(60, 160);
-    canvas->printf("Target: %s:%d", SWR_PRIMARY_IP.toString().c_str(), SWR_PORT);
+    canvas->printf("Target: %s", NET_TARGETS[0].url);
 
     canvas->flush();
 
