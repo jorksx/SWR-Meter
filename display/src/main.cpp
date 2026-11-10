@@ -313,11 +313,11 @@ uint16_t getSwrColor(float s) {
 // =========================================================================
 // DIRECT SOCKET SWR TELEMETRY FETCH
 // =========================================================================
-bool fetchTelemetryFromBridge(const char* host, uint16_t port) {
+bool fetchTelemetryFromBridge(IPAddress targetIp, uint16_t port) {
     WiFiClient client;
-    client.setTimeout(400); // 400ms timeout
+    client.setTimeout(600); // 600ms timeout
 
-    if (!client.connect(host, port)) {
+    if (!client.connect(targetIp, port, 600)) {
         return false;
     }
 
@@ -327,8 +327,8 @@ bool fetchTelemetryFromBridge(const char* host, uint16_t port) {
     String response = "";
     response.reserve(1024);
 
-    // Read full response until connection closes or 500ms timeout
-    while ((client.connected() || client.available() > 0) && (millis() - startMs < 500)) {
+    // Read full response until connection closes or 600ms timeout
+    while ((client.connected() || client.available() > 0) && (millis() - startMs < 600)) {
         while (client.available() > 0) {
             char c = (char)client.read();
             response += c;
@@ -405,10 +405,33 @@ void telemetryTask(void *pvParameters) {
 
         tele.rssi = WiFi.RSSI();
 
-        // Try primary configured target (bridge_ip), and fallback to swrmeter.local
-        bool success = fetchTelemetryFromBridge(bridge_ip.c_str(), bridge_port);
-        if (!success && bridge_ip != "swrmeter.local") {
-            success = fetchTelemetryFromBridge("swrmeter.local", 2222);
+        // Multi-target list: Configured IP, Known SWR Bridge IP, AP Fallback IP
+        IPAddress targetIps[3];
+        int numTargets = 0;
+
+        IPAddress cfgIp;
+        if (cfgIp.fromString(bridge_ip)) {
+            targetIps[numTargets++] = cfgIp;
+        }
+        IPAddress primaryIp(192, 168, 1, 159);
+        if (cfgIp != primaryIp) {
+            targetIps[numTargets++] = primaryIp;
+        }
+        IPAddress apIp(192, 168, 4, 1);
+        if (cfgIp != apIp) {
+            targetIps[numTargets++] = apIp;
+        }
+
+        bool success = false;
+        for (int i = 0; i < numTargets; i++) {
+            if (fetchTelemetryFromBridge(targetIps[i], bridge_port)) {
+                success = true;
+                if (targetIps[i] != cfgIp) {
+                    bridge_ip = targetIps[i].toString();
+                    saveConfig(wifi_ssid, wifi_psk, bridge_ip, bridge_port);
+                }
+                break;
+            }
         }
 
         if (success) {
@@ -423,7 +446,7 @@ void telemetryTask(void *pvParameters) {
             tele.swr    = 1.0f;
             tele.pa_swr = 1.0f;
             tele.is_tx  = false;
-            snprintf(dbgStatus, sizeof(dbgStatus), "SWR BRIDGE OFFLINE");
+            snprintf(dbgStatus, sizeof(dbgStatus), "BRIDGE OFFLINE (%s)", WiFi.localIP().toString().c_str());
             vTaskDelay(pdMS_TO_TICKS(350));
         }
     }
@@ -605,7 +628,7 @@ void renderCleanOledTheme() {
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_LIGHT_GRAY);
     canvas->setCursor(250, 156);
-    canvas->print("PEAK HOLD (PEP)");
+    canvas->print("PEAK HOLD");
 
     canvas->setFont(&FreeSansBold18pt7b);
     canvas->setTextColor(C_AMBER);
