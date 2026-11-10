@@ -33,6 +33,12 @@ void loadConfig() {
     bridge_ip   = prefs.getString("b_ip", "192.168.1.159");
     bridge_port = prefs.getUShort("b_port", 2222);
     prefs.end();
+
+    if (wifi_ssid.length() == 0) wifi_ssid = "Kuitunen";
+    if (wifi_psk.length() == 0) wifi_psk = "12345678";
+    if (bridge_ip.length() < 7) bridge_ip = "192.168.1.159";
+    if (bridge_port == 0) bridge_port = 2222;
+
     Serial.printf("[CONFIG] Loaded: SSID='%s', Bridge=%s:%u\n", wifi_ssid.c_str(), bridge_ip.c_str(), bridge_port);
 }
 
@@ -307,7 +313,7 @@ uint16_t getSwrColor(float s) {
 }
 
 // =========================================================================
-// BACKGROUND TELEMETRY TASK (CORE 0)
+// BACKGROUND TELEMETRY TASK (CORE 0) - DIRECT WIFICLIENT (HIGH SPEED & STABLE)
 // =========================================================================
 void telemetryTask(void *pvParameters) {
     WiFi.mode(WIFI_STA);
@@ -318,8 +324,8 @@ void telemetryTask(void *pvParameters) {
     unsigned long wifiConnectStartMs = millis();
 
     for (;;) {
-        // 1. Check WiFi Connection
-        if (WiFi.status() != WL_CONNECTED) {
+        // 1. Check WiFi Connection and valid IP address
+        if (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
             tele.connected = false;
 
             // If WiFi fails to connect for 20 seconds, start open Setup AP
@@ -345,53 +351,86 @@ void telemetryTask(void *pvParameters) {
         wifiConnectStartMs = millis();
         tele.rssi = WiFi.RSSI();
 
-        // 2. Poll SWR Bridge via HTTP
-        String targetUrl = "http://" + bridge_ip + ":" + String(bridge_port) + "/data";
+        // 2. Poll SWR Bridge via Direct WiFiClient
+        // We test primary configured target (bridge_ip:bridge_port), and fallback to swrmeter.local:2222
+        bool gotData = false;
+        const char* targets[2] = { bridge_ip.c_str(), "swrmeter.local" };
+        uint16_t ports[2] = { bridge_port, 2222 };
 
-        HTTPClient http;
-        http.begin(targetUrl);
-        http.setTimeout(750); // 750ms timeout
-        int httpCode = http.GET();
+        for (int t = 0; t < 2; t++) {
+            const char* host = targets[t];
+            uint16_t port = ports[t];
 
-        if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-            StaticJsonDocument<512> doc;
-            DeserializationError err = deserializeJson(doc, payload);
+            WiFiClient client;
+            client.setTimeout(400); // 400ms timeout
+            if (client.connect(host, port)) {
+                client.print(F("GET /data HTTP/1.1\r\nHost: swrmeter\r\nConnection: close\r\n\r\n"));
 
-            if (!err) {
-                tele.fwd_w   = doc["fwd_w"] | 0.0f;
-                tele.avg_w   = doc["avg_w"] | 0.0f;
-                tele.peak_w  = doc["peak_w"] | 0.0f;
-                tele.rev_w   = doc["rev_w"] | 0.0f;
-                tele.swr     = doc["swr"] | 1.0f;
-                tele.fwd_v   = doc["fwd_v"] | 0.0f;
-                tele.rev_v   = doc["rev_v"] | 0.0f;
-                tele.is_tx   = doc["tx"] | false;
-                tele.connected = true;
-                tele.last_seen_ms = millis();
-
-                // Smart PA/RIG SWR foldback estimation
-                float fwd = tele.fwd_w;
-                float line_s = tele.swr;
-                if (fwd < 5.0f) {
-                    tele.pa_swr = 1.0f;
-                } else if (fwd >= 75.0f) {
-                    tele.pa_swr = 1.0f;
-                } else if (line_s <= 1.5f) {
-                    tele.pa_swr = line_s;
-                } else if (fwd >= 65.0f) {
-                    float est = 1.0f + (75.0f - fwd) / 10.0f * 0.8f;
-                    tele.pa_swr = (est < line_s) ? est : line_s;
-                } else if (fwd >= 45.0f) {
-                    float est = 1.8f + (65.0f - fwd) / 20.0f * 1.0f;
-                    tele.pa_swr = (est < line_s) ? est : line_s;
-                } else {
-                    tele.pa_swr = line_s;
+                unsigned long startMs = millis();
+                while (client.connected() && client.available() == 0 && (millis() - startMs < 500)) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
                 }
-                snprintf(dbgStatus, sizeof(dbgStatus), "ONLINE (%d dBm)", tele.rssi);
+
+                if (client.available() > 0) {
+                    String statusLine = client.readStringUntil('\n');
+                    if (statusLine.indexOf("200") >= 0) {
+                        // Skip HTTP headers until empty line
+                        while (client.connected() || client.available() > 0) {
+                            String h = client.readStringUntil('\n');
+                            h.trim();
+                            if (h.length() == 0) break;
+                            if (millis() - startMs > 700) break;
+                        }
+
+                        // Read JSON body
+                        String jsonPayload = client.readStringUntil('\n');
+                        jsonPayload.trim();
+                        if (jsonPayload.length() > 0) {
+                            StaticJsonDocument<512> doc;
+                            DeserializationError err = deserializeJson(doc, jsonPayload);
+                            if (!err) {
+                                tele.fwd_w   = doc["fwd_w"] | 0.0f;
+                                tele.avg_w   = doc["avg_w"] | 0.0f;
+                                tele.peak_w  = doc["peak_w"] | 0.0f;
+                                tele.rev_w   = doc["rev_w"] | 0.0f;
+                                tele.swr     = doc["swr"] | 1.0f;
+                                tele.fwd_v   = doc["fwd_v"] | 0.0f;
+                                tele.rev_v   = doc["rev_v"] | 0.0f;
+                                tele.is_tx   = doc["tx"] | false;
+                                tele.connected = true;
+                                tele.last_seen_ms = millis();
+                                gotData = true;
+
+                                // Smart PA/RIG SWR foldback estimation
+                                float fwd = tele.fwd_w;
+                                float line_s = tele.swr;
+                                if (fwd < 5.0f) {
+                                    tele.pa_swr = 1.0f;
+                                } else if (fwd >= 75.0f) {
+                                    tele.pa_swr = 1.0f;
+                                } else if (line_s <= 1.5f) {
+                                    tele.pa_swr = line_s;
+                                } else if (fwd >= 65.0f) {
+                                    float est = 1.0f + (75.0f - fwd) / 10.0f * 0.8f;
+                                    tele.pa_swr = (est < line_s) ? est : line_s;
+                                } else if (fwd >= 45.0f) {
+                                    float est = 1.8f + (65.0f - fwd) / 20.0f * 1.0f;
+                                    tele.pa_swr = (est < line_s) ? est : line_s;
+                                } else {
+                                    tele.pa_swr = line_s;
+                                }
+                                snprintf(dbgStatus, sizeof(dbgStatus), "ONLINE (%d dBm)", tele.rssi);
+                            }
+                        }
+                    }
+                }
+                client.stop();
             }
-        } else {
-            // SWR Bridge is turned off / unreachable
+
+            if (gotData) break;
+        }
+
+        if (!gotData) {
             tele.connected = false;
             tele.fwd_w  = 0.0f;
             tele.avg_w  = 0.0f;
@@ -401,13 +440,10 @@ void telemetryTask(void *pvParameters) {
             tele.pa_swr = 1.0f;
             tele.is_tx  = false;
             snprintf(dbgStatus, sizeof(dbgStatus), "SWR BRIDGE OFFLINE");
-
-            // We do NOT disconnect WiFi! We stay happily connected to home WiFi.
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(400));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
-        http.end();
-
-        vTaskDelay(pdMS_TO_TICKS(35));
     }
 }
 
