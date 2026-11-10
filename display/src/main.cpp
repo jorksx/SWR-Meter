@@ -14,6 +14,7 @@
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
+#include <esp_wifi.h>
 #include <math.h>
 
 // =========================================================================
@@ -313,43 +314,79 @@ uint16_t getSwrColor(float s) {
 // =========================================================================
 // DIRECT SOCKET SWR TELEMETRY FETCH
 // =========================================================================
+static char lastFetchErr[24] = "INIT";
+
 bool fetchTelemetryFromBridge(IPAddress targetIp, uint16_t port) {
     WiFiClient client;
-    client.setTimeout(600); // 600ms timeout
+    client.setTimeout(1); // 1s socket timeout
 
-    if (!client.connect(targetIp, port, 600)) {
+    unsigned long t0 = millis();
+
+    // 1. Establish TCP connection with 800ms timeout
+    if (!client.connect(targetIp, port, 800)) {
+        snprintf(lastFetchErr, sizeof(lastFetchErr), "NO_TCP %d", (int)targetIp[3]);
         return false;
     }
 
+    // 2. Send HTTP GET request
     client.print(F("GET /data HTTP/1.1\r\nHost: swrmeter\r\nConnection: close\r\n\r\n"));
 
-    unsigned long startMs = millis();
-    String response = "";
-    response.reserve(1024);
+    // 3. Read complete response (headers + body) into buffer
+    char respBuf[1024];
+    int respLen = 0;
+    int bodyStart = -1;
+    int expectedContentLen = -1;
 
-    // Read full response until connection closes or 600ms timeout
-    while ((client.connected() || client.available() > 0) && (millis() - startMs < 600)) {
-        while (client.available() > 0) {
-            char c = (char)client.read();
-            response += c;
+    unsigned long waitStart = millis();
+    while ((client.connected() || client.available() > 0) && (millis() - waitStart < 350)) {
+        while (client.available() > 0 && respLen < (int)sizeof(respBuf) - 1) {
+            respBuf[respLen++] = (char)client.read();
+            respBuf[respLen] = '\0';
+
+            // Find header delimiter \r\n\r\n
+            if (bodyStart < 0) {
+                char* p = strstr(respBuf, "\r\n\r\n");
+                if (p) {
+                    bodyStart = (p - respBuf) + 4;
+                    char* cl = strcasestr(respBuf, "Content-Length:");
+                    if (cl) {
+                        expectedContentLen = atoi(cl + 15);
+                    }
+                }
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(4));
+
+        // If body is reached:
+        if (bodyStart >= 0 && respLen > bodyStart) {
+            int bodyLen = respLen - bodyStart;
+            if (expectedContentLen > 0 && bodyLen >= expectedContentLen) {
+                break; // Got full content!
+            }
+            if (respBuf[respLen - 1] == '}') {
+                break; // Closing brace of JSON received!
+            }
+        }
+
+        vTaskDelay(1); // 1 tick = 10ms
     }
+
+    // 4. CRITICAL: Immediately stop client to free lwIP socket & PCB
     client.stop();
 
-    if (response.length() == 0) return false;
+    if (bodyStart < 0 || respLen <= bodyStart) {
+        snprintf(lastFetchErr, sizeof(lastFetchErr), "NO_BODY");
+        return false;
+    }
 
-    // Split headers and body at \r\n\r\n
-    int bodyIdx = response.indexOf("\r\n\r\n");
-    if (bodyIdx < 0) return false;
-
-    String json = response.substring(bodyIdx + 4);
-    json.trim();
-    if (json.length() == 0) return false;
-
+    // 5. Deserialize JSON from bodyStart
+    char* jsonPtr = respBuf + bodyStart;
     StaticJsonDocument<512> doc;
-    DeserializationError err = deserializeJson(doc, json);
-    if (err) return false;
+    DeserializationError err = deserializeJson(doc, jsonPtr);
+    if (err) {
+        Serial.printf("[JSON ERR] err='%s' body='%.80s'\n", err.c_str(), jsonPtr);
+        snprintf(lastFetchErr, sizeof(lastFetchErr), "J_ERR");
+        return false;
+    }
 
     tele.fwd_w   = doc["fwd_w"] | 0.0f;
     tele.avg_w   = doc["avg_w"] | 0.0f;
@@ -361,6 +398,8 @@ bool fetchTelemetryFromBridge(IPAddress targetIp, uint16_t port) {
     tele.is_tx   = doc["tx"] | false;
     tele.connected = true;
     tele.last_seen_ms = millis();
+    snprintf(lastFetchErr, sizeof(lastFetchErr), "OK");
+    snprintf(lastFetchErr, sizeof(lastFetchErr), "OK");
 
     // Smart PA/RIG SWR foldback estimation
     float fwd = tele.fwd_w;
@@ -388,13 +427,22 @@ bool fetchTelemetryFromBridge(IPAddress targetIp, uint16_t port) {
 // BACKGROUND TELEMETRY TASK (CORE 0)
 // =========================================================================
 void telemetryTask(void *pvParameters) {
+    static unsigned long wifiDisconnectStart = 0;
+
     for (;;) {
         // If WiFi is disconnected and AP mode is not active:
         if (WiFi.status() != WL_CONNECTED && !apModeActive) {
             tele.connected = false;
             snprintf(dbgStatus, sizeof(dbgStatus), "WIFI: %s...", wifi_ssid.c_str());
+            if (wifiDisconnectStart == 0) wifiDisconnectStart = millis();
+            // If disconnected for more than 25 seconds, start open Setup AP
+            if (millis() - wifiDisconnectStart > 25000) {
+                startSetupAP();
+            }
             vTaskDelay(pdMS_TO_TICKS(400));
             continue;
+        } else if (WiFi.status() == WL_CONNECTED) {
+            wifiDisconnectStart = 0;
         }
 
         if (apModeActive) {
@@ -405,28 +453,42 @@ void telemetryTask(void *pvParameters) {
 
         tele.rssi = WiFi.RSSI();
 
-        // Multi-target list: Configured IP, Known SWR Bridge IP, AP Fallback IP
+        // Target IP resolution
         IPAddress targetIps[3];
         int numTargets = 0;
+        IPAddress localIp = WiFi.localIP();
+        IPAddress primaryIp(192, 168, 1, 159);
+        IPAddress apBridgeIp(192, 168, 4, 1);
 
         IPAddress cfgIp;
-        if (cfgIp.fromString(bridge_ip)) {
-            targetIps[numTargets++] = cfgIp;
-        }
-        IPAddress primaryIp(192, 168, 1, 159);
-        if (cfgIp != primaryIp) {
-            targetIps[numTargets++] = primaryIp;
-        }
-        IPAddress apIp(192, 168, 4, 1);
-        if (cfgIp != apIp) {
-            targetIps[numTargets++] = apIp;
+        bool cfgValid = cfgIp.fromString(bridge_ip) && cfgIp[0] != 0;
+
+        if (localIp[0] == 192 && localIp[1] == 168 && localIp[2] == 4) {
+            // Display is connected to bridge SoftAP (192.168.4.x)
+            targetIps[numTargets++] = apBridgeIp;
+            if (cfgValid && cfgIp != apBridgeIp) {
+                targetIps[numTargets++] = cfgIp;
+            }
+        } else {
+            // Display is on local network (e.g. 192.168.1.x)
+            if (cfgValid && cfgIp[0] == localIp[0] && cfgIp[1] == localIp[1] && cfgIp[2] == localIp[2]) {
+                targetIps[numTargets++] = cfgIp;
+                if (cfgIp != primaryIp && primaryIp[2] == localIp[2]) {
+                    targetIps[numTargets++] = primaryIp;
+                }
+            } else {
+                targetIps[numTargets++] = primaryIp;
+                if (cfgValid && cfgIp != primaryIp) {
+                    targetIps[numTargets++] = cfgIp;
+                }
+            }
         }
 
         bool success = false;
         for (int i = 0; i < numTargets; i++) {
             if (fetchTelemetryFromBridge(targetIps[i], bridge_port)) {
                 success = true;
-                if (targetIps[i] != cfgIp) {
+                if (targetIps[i].toString() != bridge_ip) {
                     bridge_ip = targetIps[i].toString();
                     saveConfig(wifi_ssid, wifi_psk, bridge_ip, bridge_port);
                 }
@@ -446,8 +508,20 @@ void telemetryTask(void *pvParameters) {
             tele.swr    = 1.0f;
             tele.pa_swr = 1.0f;
             tele.is_tx  = false;
-            snprintf(dbgStatus, sizeof(dbgStatus), "BRIDGE OFFLINE (%s)", WiFi.localIP().toString().c_str());
+            if (strncmp(lastFetchErr, "NO_TCP", 6) == 0) {
+                snprintf(dbgStatus, sizeof(dbgStatus), "SWR BRIDGE OFFLINE");
+            } else {
+                snprintf(dbgStatus, sizeof(dbgStatus), "OFFLINE: %s", lastFetchErr);
+            }
             vTaskDelay(pdMS_TO_TICKS(350));
+        }
+
+        static unsigned long lastDbgPrint = 0;
+        if (millis() - lastDbgPrint > 1000) {
+            lastDbgPrint = millis();
+            Serial.printf("[TELE] dbg='%s' conn=%d fwd=%.1f swr=%.2f b_ip=%s:%u localIP=%s ssid='%s'\n",
+                          dbgStatus, (int)tele.connected, tele.fwd_w, tele.swr, bridge_ip.c_str(), bridge_port,
+                          WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
         }
     }
 }
@@ -695,7 +769,7 @@ void renderModernTheme() {
 
     canvas->setCursor(290, 50);
     canvas->setTextColor(C_GRAY);
-    canvas->printf("PEP: %5.1f W   AVG: %5.1f W", tele.peak_w, tele.avg_w);
+    canvas->printf("PEAK: %5.1f W   AVG: %5.1f W", tele.peak_w, tele.avg_w);
 
     canvas->setFont(&FreeSansBold24pt7b);
     canvas->setTextColor(getPwrColor(tele.fwd_w));
@@ -1005,7 +1079,7 @@ void renderRetroAmberTheme() {
     // Footer
     canvas->setFont(&FreeSans9pt7b);
     canvas->setCursor(20, 246);
-    canvas->printf("REFLECTED: %5.2f W   PEP: %5.1f W   DET: %4.2fV / %4.2fV",
+    canvas->printf("REFLECTED: %5.2f W   PEAK: %5.1f W   DET: %4.2fV / %4.2fV",
                    tele.rev_w, tele.peak_w, tele.fwd_v, tele.rev_v);
 }
 
@@ -1099,6 +1173,32 @@ void setupWebServerRoutes() {
 
     otaServer.on("/", HTTP_GET, handleRoot);
     otaServer.on("/save", HTTP_POST, handleSave);
+    otaServer.on("/status", HTTP_GET, []() {
+        StaticJsonDocument<256> doc;
+        doc["connected"] = tele.connected;
+        doc["dbg"] = dbgStatus;
+        doc["err"] = lastFetchErr;
+        doc["bridge_ip"] = bridge_ip;
+        doc["bridge_port"] = bridge_port;
+        doc["fwd_w"] = tele.fwd_w;
+        doc["swr"] = tele.swr;
+        doc["rssi"] = tele.rssi;
+        String resp;
+        serializeJson(doc, resp);
+        otaServer.send(200, "application/json", resp);
+    });
+
+    otaServer.on("/scan", HTTP_GET, []() {
+        int n = WiFi.scanNetworks();
+        String json = "[";
+        for (int i = 0; i < n; i++) {
+            if (i > 0) json += ",";
+            json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+        }
+        json += "]";
+        WiFi.scanDelete();
+        otaServer.send(200, "application/json", json);
+    });
 
     // Captive Portal Detection endpoints (Android, iOS, Windows)
     otaServer.on("/generate_204", []() {
@@ -1169,25 +1269,24 @@ void startSetupAP() {
 // =========================================================================
 // OTA & MDNS INITIALIZATION (CALLED ONCE WIFI STA IS CONNECTED)
 // =========================================================================
-static bool mdnsInitialized = false;
+static bool otaStarted = false;
 
 void initOTAOnceConnected() {
     if (WiFi.status() != WL_CONNECTED) return;
+    if (otaStarted) return; // Prevent restarting WebServer repeatedly in loop!
 
     setupWebServerRoutes();
     otaServer.begin();
 
-    if (!mdnsInitialized) {
-        if (MDNS.begin("swrdisplay")) {
-            MDNS.addService("http", "tcp", 80);
-            MDNS.addService("arduino", "tcp", 3232);
-            Serial.printf("[OTA] mDNS active: http://swrdisplay.local (IP: %s)\n", WiFi.localIP().toString().c_str());
-            mdnsInitialized = true;
-        }
-        ArduinoOTA.setHostname("swrdisplay");
-        ArduinoOTA.begin();
-        Serial.println("[OTA] ArduinoOTA and WebServer started successfully!");
+    if (MDNS.begin("swrdisplay")) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("arduino", "tcp", 3232);
+        Serial.printf("[OTA] mDNS active: http://swrdisplay.local (IP: %s)\n", WiFi.localIP().toString().c_str());
     }
+    ArduinoOTA.setHostname("swrdisplay");
+    ArduinoOTA.begin();
+    otaStarted = true;
+    Serial.println("[OTA] ArduinoOTA and WebServer started successfully!");
 }
 
 // =========================================================================
@@ -1229,13 +1328,37 @@ void setup() {
     tp.begin();
     tp.setRotation(ROTATION_NORMAL);
 
-    // 4. Connect to WiFi directly here in setup() (Fast 2-3 sec connection!)
+    // 4. Connect to WiFi directly here in setup()
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    WiFi.setSleep(false);
-    Serial.printf("[WIFI] Connecting to %s...\n", wifi_ssid.c_str());
-    WiFi.begin(wifi_ssid.c_str(), wifi_psk.c_str());
+
+    // Fast scan to check if SWR-Meter-AP is broadcasting nearby
+    int n = WiFi.scanNetworks();
+    bool foundBridgeAp = false;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) == "SWR-Meter-AP") {
+            foundBridgeAp = true;
+            break;
+        }
+    }
+    WiFi.scanDelete();
+
+    String connectSsid = wifi_ssid;
+    String connectPass = wifi_psk;
+
+    if (foundBridgeAp) {
+        // SWR-Meter-AP detected! Direct connection bypasses router client-isolation completely
+        Serial.println("[WIFI] SWR-Meter-AP detected! Using direct low-latency link to bridge...");
+        connectSsid = "SWR-Meter-AP";
+        connectPass = "12345678";
+        bridge_ip = "192.168.4.1";
+        bridge_port = 2222;
+    } else {
+        Serial.printf("[WIFI] Connecting to configured network: %s...\n", wifi_ssid.c_str());
+    }
+
+    WiFi.begin(connectSsid.c_str(), connectPass.c_str());
 
     int retries = 0;
     while (WiFi.status() != WL_CONNECTED && retries < 25) {
@@ -1245,6 +1368,9 @@ void setup() {
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+        // CRITICAL: Disable modem sleep AFTER WiFi connection is established!
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        WiFi.setSleep(false);
     } else {
         Serial.println("[WIFI] Connection failed, starting Setup AP...");
         startSetupAP();
