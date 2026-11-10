@@ -6,6 +6,8 @@
 #include <Update.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <DNSServer.h>
 #include <Arduino_GFX_Library.h>
 #include <TAMC_GT911.h>
 #include <Fonts/FreeSansBold24pt7b.h>
@@ -16,25 +18,45 @@
 #include <math.h>
 
 // =========================================================================
-// WIFI & TARGET SWR METER CONFIGURATION
+// CONFIGURATION & PERSISTENT NVS STORAGE (Preferences)
 // =========================================================================
-struct NetTarget {
-    const char* ssid;
-    const char* psk;
-    const char* url;
-};
+Preferences prefs;
+String wifi_ssid   = "Kuitunen";
+String wifi_psk    = "12345678";
+String bridge_ip   = "192.168.1.159";
+uint16_t bridge_port = 2222;
 
-// Dual-target: Primary home network, fallback direct to SWR-Meter-AP!
-const NetTarget NET_TARGETS[] = {
-    { "Kuitunen",      "12345678", "http://192.168.1.159:2222/data" },
-    { "SWR-Meter-AP",  "12345678", "http://192.168.4.1:2222/data"   }
-};
-const int NET_TARGET_COUNT = 2;
+void loadConfig() {
+    prefs.begin("swr_disp", false);
+    wifi_ssid   = prefs.getString("ssid", "Kuitunen");
+    wifi_psk    = prefs.getString("psk", "12345678");
+    bridge_ip   = prefs.getString("b_ip", "192.168.1.159");
+    bridge_port = prefs.getUShort("b_port", 2222);
+    prefs.end();
+    Serial.printf("[CONFIG] Loaded: SSID='%s', Bridge=%s:%u\n", wifi_ssid.c_str(), bridge_ip.c_str(), bridge_port);
+}
 
+void saveConfig(const String& new_ssid, const String& new_psk, const String& new_ip, uint16_t new_port) {
+    prefs.begin("swr_disp", false);
+    prefs.putString("ssid", new_ssid);
+    prefs.putString("psk", new_psk);
+    prefs.putString("b_ip", new_ip);
+    prefs.putUShort("b_port", new_port);
+    prefs.end();
+    Serial.printf("[CONFIG] Saved: SSID='%s', Bridge=%s:%u\n", new_ssid.c_str(), new_ip.c_str(), new_port);
+}
+
+// Global display status string shown in the top header
 char dbgStatus[64] = "CONNECTING...";
 
-// Web OTA Server on Port 80
+// Web Server on Port 80
 WebServer otaServer(80);
+
+// Captive Portal DNS Server
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+volatile bool apModeActive = false;
+volatile bool serverRoutesConfigured = false;
 
 // =========================================================================
 // STANDBY TIMEOUT (15 MINUTES INACTIVITY -> SCREEN OFF, TX / TOUCH WAKES UP)
@@ -43,45 +65,76 @@ const unsigned long STANDBY_TIMEOUT_MS = 15UL * 60UL * 1000UL; // 15 min = 900,0
 unsigned long lastActivityTime = 0;
 bool isBacklightOn = true;
 
-// Clean Dark Mode OTA Web Interface
-const char OTA_INDEX_HTML[] PROGMEM = R"rawliteral(
+// Clean Dark Mode Web UI for Config & OTA Updates
+const char WEB_INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="fi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SWR Näyttö - OTA Päivitys</title>
+<title>SWR N&auml;ytt&ouml; - Hallintapaneeli</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
 body { background: #080c14; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; }
-.card { background: #121824; border: 1px solid #202838; border-radius: 12px; padding: 2rem; max-width: 440px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.6); }
-h1 { font-size: 1.35rem; color: #00e5ff; margin-bottom: 0.4rem; font-weight: 700; text-align: center; }
-p.sub { font-size: 0.85rem; color: #9aaabb; margin-bottom: 1.5rem; text-align: center; }
-.info-box { background: #080c14; border: 1px solid #1a2334; border-radius: 8px; padding: 0.8rem; margin-bottom: 1.5rem; font-size: 0.82rem; color: #00ff88; line-height: 1.6; }
+.card { background: #121824; border: 1px solid #202838; border-radius: 12px; padding: 1.8rem; max-width: 460px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.6); }
+h1 { font-size: 1.35rem; color: #00e5ff; margin-bottom: 0.3rem; font-weight: 700; text-align: center; }
+p.sub { font-size: 0.85rem; color: #9aaabb; margin-bottom: 1.2rem; text-align: center; }
+.info-box { background: #080c14; border: 1px solid #1a2334; border-radius: 8px; padding: 0.8rem; margin-bottom: 1.2rem; font-size: 0.82rem; line-height: 1.7; }
 .info-row { display: flex; justify-content: space-between; }
 .info-label { color: #62728d; }
-input[type=file] { display: block; width: 100%; background: #182030; border: 1px solid #243048; padding: 0.75rem; border-radius: 8px; color: #fff; margin-bottom: 1.2rem; cursor: pointer; }
-button { background: #00e5ff; color: #080c14; border: none; font-weight: 700; padding: 0.85rem; border-radius: 8px; cursor: pointer; width: 100%; font-size: 1rem; transition: background 0.2s; }
-button:hover { background: #00ff88; }
-button:disabled { background: #2a3548; color: #62728d; cursor: not-allowed; }
-#progress-wrap { display: none; margin-top: 1.2rem; }
-.bar-bg { background: #080c14; border: 1px solid #243048; border-radius: 6px; height: 16px; overflow: hidden; }
+.val-online { color: #00ff88; font-weight: 600; }
+.val-offline { color: #ffaa00; font-weight: 600; }
+.sec-title { font-size: 0.92rem; color: #00e5ff; font-weight: 700; margin: 1.2rem 0 0.6rem 0; border-bottom: 1px solid #202838; padding-bottom: 0.3rem; }
+label { display: block; font-size: 0.82rem; color: #9aaabb; margin-bottom: 0.3rem; font-weight: 500; }
+input[type=text], input[type=number], input[type=password] { width: 100%; background: #0e1420; border: 1px solid #243048; padding: 0.65rem 0.8rem; border-radius: 8px; color: #fff; font-size: 0.95rem; margin-bottom: 0.8rem; outline: none; }
+input:focus { border-color: #00e5ff; }
+.row-2 { display: flex; gap: 0.8rem; }
+.row-2 > div { flex: 1; }
+button.btn-save { background: #00e5ff; color: #080c14; border: none; font-weight: 700; padding: 0.8rem; border-radius: 8px; cursor: pointer; width: 100%; font-size: 0.95rem; transition: background 0.2s; margin-top: 0.4rem; }
+button.btn-save:hover { background: #00ff88; }
+button.btn-ota { background: #182232; color: #00e5ff; border: 1px solid #00e5ff; font-weight: 700; padding: 0.75rem; border-radius: 8px; cursor: pointer; width: 100%; font-size: 0.9rem; transition: all 0.2s; margin-top: 0.6rem; }
+button.btn-ota:hover { background: #00e5ff; color: #080c14; }
+button:disabled { background: #2a3548; color: #62728d; border-color: #2a3548; cursor: not-allowed; }
+input[type=file] { display: block; width: 100%; background: #0e1420; border: 1px solid #243048; padding: 0.6rem; border-radius: 8px; color: #fff; font-size: 0.85rem; cursor: pointer; }
+#progress-wrap { display: none; margin-top: 1rem; }
+.bar-bg { background: #080c14; border: 1px solid #243048; border-radius: 6px; height: 14px; overflow: hidden; }
 .bar-fill { background: linear-gradient(90deg, #00e5ff, #00ff88); width: 0%; height: 100%; transition: width 0.1s; }
-#status-txt { margin-top: 0.6rem; font-size: 0.85rem; color: #00e5ff; text-align: center; font-weight: 600; }
+#status-txt { margin-top: 0.5rem; font-size: 0.82rem; color: #00e5ff; text-align: center; font-weight: 600; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>ESP32-S3 SWR N&auml;ytt&ouml;</h1>
-  <p class="sub">Langaton laiteohjelmiston p&auml;ivitys (OTA)</p>
+  <p class="sub">Asetukset &amp; Ohjelmistop&auml;ivitys</p>
   <div class="info-box">
-    <div class="info-row"><span class="info-label">Laite:</span><span>4.3" NV3041A IPS</span></div>
-    <div class="info-row"><span class="info-label">Standby-tila:</span><span>15 min automaatti (TX her&auml;tt&auml;&auml;)</span></div>
-    <div class="info-row"><span class="info-label">Osoite:</span><span>swrdisplay.local</span></div>
+    <div class="info-row"><span class="info-label">Wi-Fi Tila:</span><span>%WIFI_STATUS%</span></div>
+    <div class="info-row"><span class="info-label">SWR Silta:</span><span>%BRIDGE_STATUS%</span></div>
+    <div class="info-row"><span class="info-label">Standby-aika:</span><span>15 min automaatti (TX her&auml;tt&auml;&auml;)</span></div>
   </div>
+  <form action="/save" method="POST">
+    <div class="sec-title">&#128225; SWR Silta (Bridge Kohde)</div>
+    <div class="row-2">
+      <div style="flex: 2;">
+        <label>Silta IP-osoite</label>
+        <input type="text" name="bridge_ip" value="%BRIDGE_IP%" required>
+      </div>
+      <div style="flex: 1;">
+        <label>Portti</label>
+        <input type="number" name="bridge_port" value="%BRIDGE_PORT%" required>
+      </div>
+    </div>
+    <div class="sec-title">&#128246; Wi-Fi Verkko</div>
+    <label>Wi-Fi Verkon Nimi (SSID)</label>
+    <input type="text" name="wifi_ssid" value="%WIFI_SSID%" required>
+    <label>Wi-Fi Salasana</label>
+    <input type="password" name="wifi_psk" value="%WIFI_PSK%" placeholder="Salasana...">
+    <button type="submit" class="btn-save">&#128190; Tallenna ja k&auml;ynnist&auml; uudelleen</button>
+  </form>
+  <div class="sec-title" style="margin-top: 1.5rem;">&#128640; Langaton OTA P&auml;ivitys</div>
   <form id="upload-form">
+    <label>Valitse uusi .bin ohjelmistotiedosto</label>
     <input type="file" id="file" name="update" accept=".bin" required>
-    <button type="submit" id="btn">🚀 Asenna uusi .bin ohjelmisto</button>
+    <button type="submit" id="btn" class="btn-ota">🚀 Asenna p&auml;ivitys</button>
   </form>
   <div id="progress-wrap">
     <div class="bar-bg"><div class="bar-fill" id="bar"></div></div>
@@ -109,15 +162,15 @@ document.getElementById('upload-form').onsubmit = function(e) {
     if (pe.lengthComputable) {
       var pct = Math.round((pe.loaded / pe.total) * 100);
       bar.style.width = pct + '%';
-      txt.textContent = 'Siirret&auml;&auml;n: ' + pct + '%...';
+      txt.textContent = 'Siirretään: ' + pct + '%...';
     }
   };
 
   xhr.onload = function() {
     if (xhr.status === 200) {
       bar.style.width = '100%';
-      txt.innerHTML = '&#9989; P&auml;ivitys onnistui! N&auml;ytt&ouml; k&auml;ynnistyy uudelleen...';
-      setTimeout(function() { location.href = '/'; }, 5000);
+      txt.innerHTML = '&#9989; Päivitys onnistui! Näyttö käynnistyy uudelleen...';
+      setTimeout(function() { location.href = '/'; }, 6000);
     } else {
       txt.innerHTML = '&#10060; Virhe: ' + xhr.responseText;
       btn.disabled = false;
@@ -229,6 +282,12 @@ DisplayTheme currentTheme = THEME_CLEAN_OLED;
 
 unsigned long lastTouchTime = 0;
 
+// Forward declarations
+void startSetupAP();
+void stopSetupAP();
+void setupWebServerRoutes();
+String getIndexHtml();
+
 // =========================================================================
 // COLOR HELPERS
 // =========================================================================
@@ -248,43 +307,50 @@ uint16_t getSwrColor(float s) {
 }
 
 // =========================================================================
-// BACKGROUND TELEMETRY TASK (CORE 0) - DUAL TARGET (KUITUNEN & SWR-METER-AP)
+// BACKGROUND TELEMETRY TASK (CORE 0)
 // =========================================================================
 void telemetryTask(void *pvParameters) {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
 
-    int curIdx = 0;
-    int failCount = 0;
-
-    Serial.printf("\n[TELEMETRY] Connecting WiFi: %s...\n", NET_TARGETS[curIdx].ssid);
-    WiFi.begin(NET_TARGETS[curIdx].ssid, NET_TARGETS[curIdx].psk);
+    Serial.printf("\n[TELEMETRY] Connecting WiFi: %s...\n", wifi_ssid.c_str());
+    WiFi.begin(wifi_ssid.c_str(), wifi_psk.c_str());
+    unsigned long wifiConnectStartMs = millis();
 
     for (;;) {
-        // Handle WiFi connection
+        // 1. Check WiFi Connection
         if (WiFi.status() != WL_CONNECTED) {
             tele.connected = false;
-            failCount++;
-            snprintf(dbgStatus, sizeof(dbgStatus), "WIFI: %s...", NET_TARGETS[curIdx].ssid);
 
-            if (failCount > 15) {
-                // Switch between Home Wi-Fi (Kuitunen) and Purkki Direct AP (SWR-Meter-AP)
-                curIdx = (curIdx + 1) % NET_TARGET_COUNT;
-                failCount = 0;
-                Serial.printf("[TELEMETRY] Switching to %s...\n", NET_TARGETS[curIdx].ssid);
-                WiFi.disconnect();
-                WiFi.begin(NET_TARGETS[curIdx].ssid, NET_TARGETS[curIdx].psk);
+            // If WiFi fails to connect for 20 seconds, start open Setup AP
+            if ((millis() - wifiConnectStartMs > 20000) && !apModeActive) {
+                startSetupAP();
             }
+
+            if (apModeActive) {
+                snprintf(dbgStatus, sizeof(dbgStatus), "AP: SWR-Display-Setup");
+            } else {
+                snprintf(dbgStatus, sizeof(dbgStatus), "WIFI: %s...", wifi_ssid.c_str());
+            }
+
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
+        // WiFi IS connected!
+        if (apModeActive && WiFi.softAPgetStationNum() == 0) {
+            stopSetupAP();
+        }
+
+        wifiConnectStartMs = millis();
         tele.rssi = WiFi.RSSI();
-        const char* targetUrl = NET_TARGETS[curIdx].url;
+
+        // 2. Poll SWR Bridge via HTTP
+        String targetUrl = "http://" + bridge_ip + ":" + String(bridge_port) + "/data";
 
         HTTPClient http;
         http.begin(targetUrl);
-        http.setTimeout(800); // 800ms timeout
+        http.setTimeout(750); // 750ms timeout
         int httpCode = http.GET();
 
         if (httpCode == HTTP_CODE_OK) {
@@ -303,7 +369,6 @@ void telemetryTask(void *pvParameters) {
                 tele.is_tx   = doc["tx"] | false;
                 tele.connected = true;
                 tele.last_seen_ms = millis();
-                failCount = 0;
 
                 // Smart PA/RIG SWR foldback estimation
                 float fwd = tele.fwd_w;
@@ -311,7 +376,7 @@ void telemetryTask(void *pvParameters) {
                 if (fwd < 5.0f) {
                     tele.pa_swr = 1.0f;
                 } else if (fwd >= 75.0f) {
-                    tele.pa_swr = 1.0f; // ATU matched load, full power safely dispatched
+                    tele.pa_swr = 1.0f;
                 } else if (line_s <= 1.5f) {
                     tele.pa_swr = line_s;
                 } else if (fwd >= 65.0f) {
@@ -326,26 +391,23 @@ void telemetryTask(void *pvParameters) {
                 snprintf(dbgStatus, sizeof(dbgStatus), "ONLINE (%d dBm)", tele.rssi);
             }
         } else {
-            failCount++;
-            if (millis() - tele.last_seen_ms > 2000) {
-                tele.connected = false;
-            }
-            snprintf(dbgStatus, sizeof(dbgStatus), "%s: ERR %d", NET_TARGETS[curIdx].ssid, httpCode);
+            // SWR Bridge is turned off / unreachable
+            tele.connected = false;
+            tele.fwd_w  = 0.0f;
+            tele.avg_w  = 0.0f;
+            tele.peak_w = 0.0f;
+            tele.rev_w  = 0.0f;
+            tele.swr    = 1.0f;
+            tele.pa_swr = 1.0f;
+            tele.is_tx  = false;
+            snprintf(dbgStatus, sizeof(dbgStatus), "SWR BRIDGE OFFLINE");
 
-            // If 6 consecutive HTTP failures (e.g. router AP isolation blocks client-to-client):
-            // Switch network immediately!
-            if (failCount > 6) {
-                curIdx = (curIdx + 1) % NET_TARGET_COUNT;
-                failCount = 0;
-                Serial.printf("[TELEMETRY] HTTP failstreak -> Switching to %s...\n", NET_TARGETS[curIdx].ssid);
-                WiFi.disconnect();
-                WiFi.begin(NET_TARGETS[curIdx].ssid, NET_TARGETS[curIdx].psk);
-                vTaskDelay(pdMS_TO_TICKS(500));
-            }
+            // We do NOT disconnect WiFi! We stay happily connected to home WiFi.
+            vTaskDelay(pdMS_TO_TICKS(500));
         }
         http.end();
 
-        vTaskDelay(pdMS_TO_TICKS(40));
+        vTaskDelay(pdMS_TO_TICKS(35));
     }
 }
 
@@ -368,13 +430,13 @@ void drawSmoothBar(int x, int y, int w, int h, float val, float max_val, float p
             float t = (float)i / (float)innerW;
             uint16_t col;
             if (t < 0.5f) {
-                // Green to Yellow
-                uint8_t r = (uint8_t)(t * 2.0f * 31);
-                col = (r << 11) | (63 << 5) | 0;
+                col = C_NEON_GREEN;
+            } else if (t < 0.75f) {
+                col = C_YELLOW;
+            } else if (t < 0.90f) {
+                col = C_ORANGE;
             } else {
-                // Yellow to Red
-                uint8_t g = (uint8_t)((1.0f - (t - 0.5f) * 2.0f) * 63);
-                col = (31 << 11) | (g << 5) | 0;
+                col = C_BRIGHT_RED;
             }
             canvas->drawFastVLine(x + 2 + i, y + 2, innerH, col);
         }
@@ -468,7 +530,7 @@ void renderCleanOledTheme() {
     // Power bar
     drawSmoothBar(14, 114, 215, 8, tele.fwd_w, 120.0f, tele.peak_w);
 
-    // Right Columns: SWR - Separate Boxes (Never Overlap!)
+    // Right Columns: SWR - Separate Boxes
     // ANT SWR Box (x: 248 .. 350)
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_LIGHT_GRAY);
@@ -499,45 +561,62 @@ void renderCleanOledTheme() {
     canvas->printf("%4.2f", tele.pa_swr);
     drawSmoothSwrBar(365, 114, 100, 8, tele.pa_swr);
 
-    // -------------------------------------------------------------
-    // LOWER CARD: TELEMETRY (y: 138 .. 264, h: 126)
-    // -------------------------------------------------------------
-    canvas->drawRoundRect(10, 138, 460, 124, 6, C_CARD_BORDER);
+    // Horizontal divider
+    canvas->drawFastHLine(10, 134, 460, C_CARD_BORDER);
 
-    // Column 1: AVG (VU)
+    // -------------------------------------------------------------
+    // SECONDARY ROW: AVG (VU) POWER & PEAK HOLD
+    // -------------------------------------------------------------
     canvas->setFont(&FreeSans9pt7b);
-    canvas->setTextColor(C_GRAY);
-    canvas->setCursor(24, 168);
-    canvas->print("AVG (VU)");
-    canvas->setCursor(24, 198);
-    canvas->setTextColor(C_WHITE);
-    canvas->setFont(&FreeSansBold12pt7b);
-    canvas->printf("%5.1f W", tele.avg_w);
+    canvas->setTextColor(C_LIGHT_GRAY);
+    canvas->setCursor(16, 156);
+    canvas->print("AVG (VU) POWER");
 
-    // Column 2: PEP PEAK
-    canvas->setFont(&FreeSans9pt7b);
+    canvas->setFont(&FreeSansBold18pt7b);
+    canvas->setTextColor(C_CYAN);
+    canvas->setCursor(14, 192);
+    canvas->printf("%5.1f", tele.avg_w);
+    canvas->setFont(&FreeSansBold9pt7b);
     canvas->setTextColor(C_GRAY);
-    canvas->setCursor(175, 168);
-    canvas->print("PEP PEAK");
-    canvas->setCursor(175, 198);
+    canvas->setCursor(110, 192);
+    canvas->print("W");
+
+    drawSmoothBar(14, 206, 215, 6, tele.avg_w, 120.0f);
+
+    // Peak Hold
+    canvas->setFont(&FreeSans9pt7b);
+    canvas->setTextColor(C_LIGHT_GRAY);
+    canvas->setCursor(250, 156);
+    canvas->print("PEAK HOLD (PEP)");
+
+    canvas->setFont(&FreeSansBold18pt7b);
     canvas->setTextColor(C_AMBER);
-    canvas->setFont(&FreeSansBold12pt7b);
-    canvas->printf("%5.1f W", tele.peak_w);
-
-    // Column 3: REFLECTED POWER
-    canvas->setFont(&FreeSans9pt7b);
+    canvas->setCursor(248, 192);
+    canvas->printf("%5.1f", tele.peak_w);
+    canvas->setFont(&FreeSansBold9pt7b);
     canvas->setTextColor(C_GRAY);
-    canvas->setCursor(325, 168);
+    canvas->setCursor(344, 192);
+    canvas->print("W");
+
+    // Reflected Power
+    canvas->setFont(&FreeSans9pt7b);
+    canvas->setTextColor(C_LIGHT_GRAY);
+    canvas->setCursor(375, 156);
     canvas->print("REFLECTED");
-    canvas->setCursor(325, 198);
+
+    canvas->setFont(&FreeSansBold18pt7b);
     canvas->setTextColor(C_BRIGHT_RED);
-    canvas->setFont(&FreeSansBold12pt7b);
-    canvas->printf("%5.2f W", tele.rev_w);
+    canvas->setCursor(373, 192);
+    canvas->printf("%4.1f", tele.rev_w);
+    canvas->setFont(&FreeSansBold9pt7b);
+    canvas->setTextColor(C_GRAY);
+    canvas->setCursor(450, 192);
+    canvas->print("W");
 
-    // Horizontal divider inside lower card
-    canvas->drawFastHLine(20, 218, 440, C_CARD_BORDER);
+    // Horizontal divider
+    canvas->drawFastHLine(10, 224, 460, C_CARD_BORDER);
 
-    // Detector voltages row (No extra footer or tap text!)
+    // Detector voltages row
     canvas->setFont(&FreeSans9pt7b);
     canvas->setTextColor(C_GRAY);
     canvas->setCursor(24, 246);
@@ -658,9 +737,6 @@ void renderCrossNeedleTheme() {
     int cx0 = 240;
     int cy0 = 250; // Central baseline anchor for SWR fan lines
 
-    // Authentic Daiwa/Diamond geometry:
-    // Left pivot (Reflected needle): starts on LEFT (xL, yL) and sweeps UP & RIGHT!
-    // Right pivot (Forward needle): starts on RIGHT (xR, yR) and sweeps UP & LEFT!
     int xL = 95, yL = 252;
     int xR = 385, yR = 252;
 
@@ -727,64 +803,30 @@ void renderCrossNeedleTheme() {
     }
 
     // Reflected Power Scale Arc (Red)
-    int prevRefX = -1, prevRefY = -1;
+    int prevRevX = -1, prevRevY = -1;
     for (int i = 0; i <= 30; i++) {
         float t = (float)i / 30.0f;
         int px = (int)((1 - t) * (1 - t) * (W - 45) + 2 * (1 - t) * t * (W - 155) + t * t * 170);
         int py = (int)((1 - t) * (1 - t) * 210 + 2 * (1 - t) * t * 80 + t * t * 40);
-        if (prevRefX != -1) {
-            canvas->drawLine(prevRefX, prevRefY, px, py, C_BRIGHT_RED);
+        if (prevRevX != -1) {
+            canvas->drawLine(prevRevX, prevRevY, px, py, C_BRIGHT_RED);
         }
-        prevRefX = px;
-        prevRefY = py;
+        prevRevX = px;
+        prevRevY = py;
     }
 
-    // Forward Ticks & Labels
-    struct ScaleTick { float t; const char* lbl; int ox; int oy; };
-    const ScaleTick fwdTicks[] = {
-        { 0.00f, "0",   -14,   4 },
-        { 0.29f, "10",  -16,  -2 },
-        { 0.46f, "25",  -16,  -6 },
-        { 0.65f, "50",  -14, -10 },
-        { 0.79f, "75",  -10, -12 },
-        { 0.91f, "100",  -8, -14 },
-        { 1.00f, "120W", -6, -14 }
-    };
-    canvas->setFont(&FreeSans9pt7b);
-    for (int i = 0; i < 7; i++) {
-        float t = fwdTicks[i].t;
-        int px = (int)((1 - t) * (1 - t) * 45 + 2 * (1 - t) * t * 155 + t * t * 310);
-        int py = (int)((1 - t) * (1 - t) * 210 + 2 * (1 - t) * t * 80 + t * t * 40);
-        canvas->fillCircle(px, py, 2, C_NEON_GREEN);
-        canvas->setTextColor(C_LIGHT_GRAY);
-        canvas->setCursor(px + fwdTicks[i].ox, py + fwdTicks[i].oy);
-        canvas->print(fwdTicks[i].lbl);
-    }
-
-    // Reflected Ticks & Labels
-    const ScaleTick refTicks[] = {
-        { 0.00f, "0",     6,   4 },
-        { 0.45f, "5",     6,  -6 },
-        { 0.63f, "10",    4, -10 },
-        { 0.89f, "20",    0, -14 },
-        { 1.00f, "25W", -12, -14 }
-    };
-    for (int i = 0; i < 5; i++) {
-        float t = refTicks[i].t;
-        int px = (int)((1 - t) * (1 - t) * (W - 45) + 2 * (1 - t) * t * (W - 155) + t * t * 170);
-        int py = (int)((1 - t) * (1 - t) * 210 + 2 * (1 - t) * t * 80 + t * t * 40);
-        canvas->fillCircle(px, py, 2, C_BRIGHT_RED);
-        canvas->setTextColor(C_LIGHT_GRAY);
-        canvas->setCursor(px + refTicks[i].ox, py + refTicks[i].oy);
-        canvas->print(refTicks[i].lbl);
-    }
-
-    // Scale Headers
+    // Scale Headers & Status
     canvas->setFont(&FreeSansBold9pt7b);
     canvas->setTextColor(C_NEON_GREEN);
     canvas->setCursor(22, 28);
     canvas->print("FORWARD");
 
+    canvas->setFont(&FreeSans9pt7b);
+    canvas->setTextColor(tele.connected ? C_NEON_GREEN : C_AMBER);
+    canvas->setCursor(140, 28);
+    canvas->print(dbgStatus);
+
+    canvas->setFont(&FreeSansBold9pt7b);
     canvas->setTextColor(C_BRIGHT_RED);
     canvas->setCursor(350, 28);
     canvas->print("REFLECTED");
@@ -927,78 +969,114 @@ void renderRetroAmberTheme() {
 }
 
 // =========================================================================
-// SETUP
+// CAPTIVE PORTAL & WEB SERVER IMPLEMENTATION
 // =========================================================================
-void setup() {
-    Serial.begin(115200);
-    delay(200);
-    Serial.println("\n=== 4.3\" SWR & POWER MONITOR DESKTOP STATION ===");
+String getIndexHtml() {
+    String html = FPSTR(WEB_INDEX_HTML);
+    html.replace("%BRIDGE_IP%", bridge_ip);
+    html.replace("%BRIDGE_PORT%", String(bridge_port));
+    html.replace("%WIFI_SSID%", wifi_ssid);
+    html.replace("%WIFI_PSK%", wifi_psk);
 
-    // 1. Turn on LCD Backlight
-    pinMode(GFX_BL, OUTPUT);
-    digitalWrite(GFX_BL, HIGH);
+    String wifiStatus;
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiStatus = "<span class='val-online'>Yhdistetty (" + WiFi.SSID() + ", " + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)</span>";
+    } else if (apModeActive) {
+        wifiStatus = "<span class='val-offline'>Setup AP aktiivinen (192.168.4.1)</span>";
+    } else {
+        wifiStatus = "<span class='val-offline'>Yhdistet&auml;&auml;n...</span>";
+    }
+    html.replace("%WIFI_STATUS%", wifiStatus);
 
-    // 2. Initialize Canvas & Display
-    canvas->begin();
-    canvas->fillScreen(C_BLACK);
+    String bridgeStatus;
+    if (tele.connected) {
+        bridgeStatus = "<span class='val-online'>ONLINE (P&auml;ivittyy)</span>";
+    } else {
+        bridgeStatus = "<span class='val-offline'>OFFLINE</span>";
+    }
+    html.replace("%BRIDGE_STATUS%", bridgeStatus);
 
-    // Initial Splash Screen (Smooth fonts)
-    canvas->setFont(&FreeSansBold12pt7b);
-    canvas->setTextColor(C_CYAN);
-    canvas->setCursor(60, 90);
-    canvas->print("SWR & POWER MONITOR");
-
-    canvas->setFont(&FreeSans9pt7b);
-    canvas->setTextColor(C_WHITE);
-    canvas->setCursor(60, 130);
-    canvas->printf("Connecting WiFi: %s...", NET_TARGETS[0].ssid);
-
-    canvas->setTextColor(C_GRAY);
-    canvas->setCursor(60, 160);
-    canvas->printf("Target: %s", NET_TARGETS[0].url);
-
-    canvas->flush();
-
-    // 3. Initialize Capacitive Touch
-    tp.begin();
-    tp.setRotation(ROTATION_NORMAL);
-
-    // 4. Start Background Telemetry Task on Core 0
-    xTaskCreatePinnedToCore(
-        telemetryTask,
-        "TelemetryTask",
-        8192,
-        NULL,
-        1,
-        NULL,
-        0 // Core 0
-    );
-
-    lastActivityTime = millis();
-    isBacklightOn = true;
-
-    delay(400);
+    return html;
 }
 
-// =========================================================================
-// OTA INITIALIZATION (SAFELY CALLED ONLY ONCE WIFI IS CONNECTED)
-// =========================================================================
-static bool otaInitialized = false;
-
-void initOTAOnceConnected() {
-    if (otaInitialized || WiFi.status() != WL_CONNECTED) return;
-
-    if (MDNS.begin("swrdisplay")) {
-        MDNS.addService("http", "tcp", 80);
-        MDNS.addService("arduino", "tcp", 3232);
-        Serial.printf("[OTA] mDNS active: http://swrdisplay.local (IP: %s)\n", WiFi.localIP().toString().c_str());
+bool captivePortal() {
+    if (!apModeActive) return false;
+    String host = otaServer.hostHeader();
+    if (host.indexOf("192.168.4.1") < 0) {
+        Serial.printf("[CAPTIVE] Redirecting host '%s' to http://192.168.4.1/\n", host.c_str());
+        otaServer.sendHeader("Location", "http://192.168.4.1/", true);
+        otaServer.send(302, "text/plain", "");
+        return true;
     }
+    return false;
+}
 
-    otaServer.on("/", HTTP_GET, []() {
+void handleRoot() {
+    otaServer.sendHeader("Connection", "close");
+    otaServer.send(200, "text/html", getIndexHtml());
+}
+
+void handleSave() {
+    String new_ip = otaServer.arg("bridge_ip");
+    String new_port_str = otaServer.arg("bridge_port");
+    String new_ssid = otaServer.arg("wifi_ssid");
+    String new_psk = otaServer.arg("wifi_psk");
+
+    new_ip.trim();
+    new_ssid.trim();
+    uint16_t new_port = new_port_str.toInt();
+    if (new_port == 0) new_port = 2222;
+
+    if (new_ip.length() > 0 && new_ssid.length() > 0) {
+        saveConfig(new_ssid, new_psk, new_ip, new_port);
+        bridge_ip = new_ip;
+        bridge_port = new_port;
+        wifi_ssid = new_ssid;
+        wifi_psk = new_psk;
+
+        String html = "<!DOCTYPE html><html lang='fi'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+                      "<style>body{background:#080c14;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;text-align:center;padding:1rem;}"
+                      ".box{background:#121824;padding:2rem;border-radius:12px;border:1px solid #202838;max-width:400px;box-shadow:0 10px 30px rgba(0,0,0,0.6);}"
+                      "h2{color:#00ff88;margin-bottom:1rem;}p{color:#9aaabb;margin-bottom:0.6rem;line-height:1.5;}</style></head><body>"
+                      "<div class='box'><h2>&#9989; Asetukset tallennettu!</h2>"
+                      "<p><strong>SWR Silta:</strong> " + new_ip + ":" + String(new_port) + "</p>"
+                      "<p><strong>Wi-Fi:</strong> " + new_ssid + "</p>"
+                      "<p style='color:#00e5ff;margin-top:1.2rem;font-weight:600;'>N&auml;ytt&ouml; k&auml;ynnistyy nyt uudelleen...</p></div>"
+                      "<script>setTimeout(function(){location.href='/';}, 6000);</script></body></html>";
+
         otaServer.sendHeader("Connection", "close");
-        otaServer.send_P(200, "text/html", OTA_INDEX_HTML);
+        otaServer.send(200, "text/html", html);
+        delay(600);
+        ESP.restart();
+    } else {
+        otaServer.send(400, "text/plain", "Virheelliset parametrit!");
+    }
+}
+
+void setupWebServerRoutes() {
+    if (serverRoutesConfigured) return;
+
+    otaServer.on("/", HTTP_GET, handleRoot);
+    otaServer.on("/save", HTTP_POST, handleSave);
+
+    // Captive Portal Detection endpoints (Android, iOS, Windows)
+    otaServer.on("/generate_204", []() {
+        if (!captivePortal()) handleRoot();
+    });
+    otaServer.on("/hotspot-detect.html", []() {
+        if (!captivePortal()) handleRoot();
+    });
+    otaServer.on("/canonical.html", []() {
+        if (!captivePortal()) handleRoot();
+    });
+    otaServer.on("/connecttest.txt", []() {
+        if (!captivePortal()) handleRoot();
+    });
+    otaServer.on("/ncsi.txt", []() {
+        if (!captivePortal()) handleRoot();
     });
 
+    // OTA Update Endpoint
     otaServer.on("/update", HTTP_POST, []() {
         otaServer.sendHeader("Connection", "close");
         otaServer.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
@@ -1024,13 +1102,118 @@ void initOTAOnceConnected() {
         }
     });
 
+    otaServer.onNotFound([]() {
+        if (captivePortal()) return;
+        otaServer.send(404, "text/plain", "404 Not Found");
+    });
+
+    serverRoutesConfigured = true;
+    Serial.println("[HTTP] WebServer routes registered.");
+}
+
+void startSetupAP() {
+    if (apModeActive) return;
+    Serial.println("[AP] Starting open Setup AP: SWR-Display-Setup...");
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+    WiFi.softAP("SWR-Display-Setup"); // Open network, no password!
+    delay(100);
+    dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+    setupWebServerRoutes();
+    otaServer.begin();
+    apModeActive = true;
+    Serial.println("[AP] Setup AP running at 192.168.4.1 (DNS port 53 active)");
+}
+
+void stopSetupAP() {
+    if (!apModeActive) return;
+    Serial.println("[AP] Stopping Setup AP...");
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    apModeActive = false;
+    Serial.println("[AP] Setup AP stopped, back to STA mode.");
+}
+
+// =========================================================================
+// OTA & MDNS INITIALIZATION (CALLED ONCE WIFI STA IS CONNECTED)
+// =========================================================================
+static bool mdnsInitialized = false;
+
+void initOTAOnceConnected() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    setupWebServerRoutes();
     otaServer.begin();
 
-    ArduinoOTA.setHostname("swrdisplay");
-    ArduinoOTA.begin();
+    if (!mdnsInitialized) {
+        if (MDNS.begin("swrdisplay")) {
+            MDNS.addService("http", "tcp", 80);
+            MDNS.addService("arduino", "tcp", 3232);
+            Serial.printf("[OTA] mDNS active: http://swrdisplay.local (IP: %s)\n", WiFi.localIP().toString().c_str());
+            mdnsInitialized = true;
+        }
+        ArduinoOTA.setHostname("swrdisplay");
+        ArduinoOTA.begin();
+        Serial.println("[OTA] ArduinoOTA and WebServer started successfully!");
+    }
+}
 
-    otaInitialized = true;
-    Serial.println("[OTA] ArduinoOTA and WebServer started successfully!");
+// =========================================================================
+// SETUP
+// =========================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+    Serial.println("\n=== 4.3\" SWR & POWER MONITOR DESKTOP STATION ===");
+
+    // 0. Load Configuration from NVS
+    loadConfig();
+
+    // 1. Turn on LCD Backlight
+    pinMode(GFX_BL, OUTPUT);
+    digitalWrite(GFX_BL, HIGH);
+
+    // 2. Initialize Canvas & Display
+    canvas->begin();
+    canvas->fillScreen(C_BLACK);
+
+    // Initial Splash Screen (Smooth fonts)
+    canvas->setFont(&FreeSansBold12pt7b);
+    canvas->setTextColor(C_CYAN);
+    canvas->setCursor(60, 90);
+    canvas->print("SWR & POWER MONITOR");
+
+    canvas->setFont(&FreeSans9pt7b);
+    canvas->setTextColor(C_WHITE);
+    canvas->setCursor(60, 130);
+    canvas->printf("Connecting WiFi: %s...", wifi_ssid.c_str());
+
+    canvas->setTextColor(C_GRAY);
+    canvas->setCursor(60, 160);
+    canvas->printf("Target: http://%s:%u/data", bridge_ip.c_str(), bridge_port);
+
+    canvas->flush();
+
+    // 3. Initialize Capacitive Touch
+    tp.begin();
+    tp.setRotation(ROTATION_NORMAL);
+
+    // 4. Start Background Telemetry Task on Core 0
+    xTaskCreatePinnedToCore(
+        telemetryTask,
+        "TelemetryTask",
+        8192,
+        NULL,
+        1,
+        NULL,
+        0 // Core 0
+    );
+
+    lastActivityTime = millis();
+    isBacklightOn = true;
+
+    delay(400);
 }
 
 // =========================================================================
@@ -1039,13 +1222,14 @@ void initOTAOnceConnected() {
 void loop() {
     unsigned long now = millis();
 
-    // 1. Service OTA safely if WiFi is connected
-    if (WiFi.status() == WL_CONNECTED) {
+    // 1. Service Network & OTA
+    if (apModeActive) {
+        dnsServer.processNextRequest();
+        otaServer.handleClient();
+    } else if (WiFi.status() == WL_CONNECTED) {
         initOTAOnceConnected();
-        if (otaInitialized) {
-            otaServer.handleClient();
-            ArduinoOTA.handle();
-        }
+        otaServer.handleClient();
+        ArduinoOTA.handle();
     }
 
     // 2. Transmit activity detection -> Wakes screen and resets 15-minute standby timer
