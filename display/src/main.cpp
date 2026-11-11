@@ -290,8 +290,12 @@ unsigned long lastTouchTime = 0;
 
 // Forward declarations
 void startSetupAP();
+void stopSetupAP();
 void setupWebServerRoutes();
 String getIndexHtml();
+bool captivePortal();
+void handleRoot();
+void handleSave();
 
 // =========================================================================
 // COLOR HELPERS
@@ -427,78 +431,151 @@ bool fetchTelemetryFromBridge(IPAddress targetIp, uint16_t port) {
 // BACKGROUND TELEMETRY TASK (CORE 0)
 // =========================================================================
 void telemetryTask(void *pvParameters) {
-    static unsigned long wifiDisconnectStart = 0;
+    unsigned long lastBridgeScan = 0;
+    unsigned long wifiDisconnectStart = 0;
+    int consecutiveBridgeFailures = 0;
 
     for (;;) {
-        // If WiFi is disconnected and AP mode is not active:
-        if (WiFi.status() != WL_CONNECTED && !apModeActive) {
-            tele.connected = false;
-            snprintf(dbgStatus, sizeof(dbgStatus), "WIFI: %s...", wifi_ssid.c_str());
-            if (wifiDisconnectStart == 0) wifiDisconnectStart = millis();
-            // If disconnected for more than 25 seconds, start open Setup AP
-            if (millis() - wifiDisconnectStart > 25000) {
-                startSetupAP();
-            }
-            vTaskDelay(pdMS_TO_TICKS(400));
-            continue;
-        } else if (WiFi.status() == WL_CONNECTED) {
-            wifiDisconnectStart = 0;
-        }
-
+        // -------------------------------------------------------------
+        // CASE 1: Setup AP Mode is active
+        // -------------------------------------------------------------
         if (apModeActive) {
             snprintf(dbgStatus, sizeof(dbgStatus), "AP: SWR-Display-Setup");
+            // Check every 3 seconds if SWR-Meter-AP has become available
+            if (millis() - lastBridgeScan >= 3000) {
+                lastBridgeScan = millis();
+                int n = WiFi.scanNetworks();
+                bool found = false;
+                for (int i = 0; i < n; i++) {
+                    if (WiFi.SSID(i) == "SWR-Meter-AP") {
+                        found = true;
+                        break;
+                    }
+                }
+                WiFi.scanDelete();
+                if (found) {
+                    Serial.println("[AP] SWR-Meter-AP detected! Exiting Setup AP and connecting...");
+                    stopSetupAP();
+                    WiFi.begin("SWR-Meter-AP", "12345678");
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
+                }
+            }
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
+        // -------------------------------------------------------------
+        // CASE 2: WiFi not connected
+        // -------------------------------------------------------------
+        if (WiFi.status() != WL_CONNECTED) {
+            tele.connected = false;
+            tele.fwd_w  = 0.0f;
+            tele.avg_w  = 0.0f;
+            tele.peak_w = 0.0f;
+            tele.rev_w  = 0.0f;
+            tele.swr    = 1.0f;
+            tele.pa_swr = 1.0f;
+            tele.is_tx  = false;
+
+            if (wifiDisconnectStart == 0) wifiDisconnectStart = millis();
+
+            snprintf(dbgStatus, sizeof(dbgStatus), "WIFI YHDISTETÄÄN...");
+
+            // Try fast scan every 3 seconds to find either SWR-Meter-AP or home Wi-Fi
+            if (millis() - lastBridgeScan >= 3000) {
+                lastBridgeScan = millis();
+                int n = WiFi.scanNetworks();
+                bool foundBridge = false;
+                for (int i = 0; i < n; i++) {
+                    if (WiFi.SSID(i) == "SWR-Meter-AP") {
+                        foundBridge = true;
+                        break;
+                    }
+                }
+                WiFi.scanDelete();
+
+                if (foundBridge) {
+                    Serial.println("[WIFI] SWR-Meter-AP seen! Connecting...");
+                    WiFi.begin("SWR-Meter-AP", "12345678");
+                } else {
+                    Serial.printf("[WIFI] Connecting to %s...\n", wifi_ssid.c_str());
+                    WiFi.begin(wifi_ssid.c_str(), wifi_psk.c_str());
+                }
+            }
+
+            // Only launch Setup AP if completely disconnected from ALL networks for > 45 seconds
+            if (millis() - wifiDisconnectStart > 45000) {
+                Serial.println("[WIFI] Disconnected for 45s, starting open Setup AP...");
+                startSetupAP();
+                wifiDisconnectStart = 0;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(400));
+            continue;
+        }
+
+        // WiFi IS CONNECTED!
+        wifiDisconnectStart = 0;
         tele.rssi = WiFi.RSSI();
+        String currentSsid = WiFi.SSID();
 
-        // Target IP resolution
-        IPAddress targetIps[3];
-        int numTargets = 0;
-        IPAddress localIp = WiFi.localIP();
-        IPAddress primaryIp(192, 168, 1, 159);
-        IPAddress apBridgeIp(192, 168, 4, 1);
-
-        IPAddress cfgIp;
-        bool cfgValid = cfgIp.fromString(bridge_ip) && cfgIp[0] != 0;
-
-        if (localIp[0] == 192 && localIp[1] == 168 && localIp[2] == 4) {
-            // Display is connected to bridge SoftAP (192.168.4.x)
-            targetIps[numTargets++] = apBridgeIp;
-            if (cfgValid && cfgIp != apBridgeIp) {
-                targetIps[numTargets++] = cfgIp;
-            }
-        } else {
-            // Display is on local network (e.g. 192.168.1.x)
-            if (cfgValid && cfgIp[0] == localIp[0] && cfgIp[1] == localIp[1] && cfgIp[2] == localIp[2]) {
-                targetIps[numTargets++] = cfgIp;
-                if (cfgIp != primaryIp && primaryIp[2] == localIp[2]) {
-                    targetIps[numTargets++] = primaryIp;
-                }
+        // -------------------------------------------------------------
+        // CASE 3: Connected directly to SWR-Meter-AP (192.168.4.1)
+        // -------------------------------------------------------------
+        if (currentSsid == "SWR-Meter-AP") {
+            IPAddress apBridgeIp(192, 168, 4, 1);
+            if (fetchTelemetryFromBridge(apBridgeIp, 2222)) {
+                consecutiveBridgeFailures = 0;
+                snprintf(dbgStatus, sizeof(dbgStatus), "ONLINE (%d dBm)", tele.rssi);
+                vTaskDelay(pdMS_TO_TICKS(35));
+                continue;
             } else {
-                targetIps[numTargets++] = primaryIp;
-                if (cfgValid && cfgIp != primaryIp) {
-                    targetIps[numTargets++] = cfgIp;
+                consecutiveBridgeFailures++;
+                tele.connected = false;
+                tele.fwd_w  = 0.0f;
+                tele.avg_w  = 0.0f;
+                tele.peak_w = 0.0f;
+                tele.rev_w  = 0.0f;
+                tele.swr    = 1.0f;
+                tele.pa_swr = 1.0f;
+                tele.is_tx  = false;
+                snprintf(dbgStatus, sizeof(dbgStatus), "SWR BRIDGE OFFLINE");
+
+                // If bridge powered off (3 failed attempts), immediately switch to home Wi-Fi!
+                if (consecutiveBridgeFailures >= 3) {
+                    Serial.println("[ROAM] SWR-Meter-AP offline (bridge powered off). Switching to home Wi-Fi...");
+                    consecutiveBridgeFailures = 0;
+                    WiFi.disconnect();
+                    WiFi.begin(wifi_ssid.c_str(), wifi_psk.c_str());
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
                 }
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
             }
         }
 
-        bool success = false;
-        for (int i = 0; i < numTargets; i++) {
-            if (fetchTelemetryFromBridge(targetIps[i], bridge_port)) {
-                success = true;
-                if (targetIps[i].toString() != bridge_ip) {
-                    bridge_ip = targetIps[i].toString();
-                    saveConfig(wifi_ssid, wifi_psk, bridge_ip, bridge_port);
-                }
-                break;
-            }
+        // -------------------------------------------------------------
+        // CASE 4: Connected to home Wi-Fi (e.g. "Kuitunen")
+        // -------------------------------------------------------------
+        // First try to fetch from configured bridge IP on home network
+        IPAddress cfgIp;
+        bool hasCfgIp = cfgIp.fromString(bridge_ip) && cfgIp[0] != 0 && cfgIp != IPAddress(192, 168, 4, 1);
+        IPAddress primaryIp(192, 168, 1, 159);
+
+        bool gotTelemetry = false;
+        if (hasCfgIp && fetchTelemetryFromBridge(cfgIp, bridge_port)) {
+            gotTelemetry = true;
+        } else if (primaryIp != cfgIp && fetchTelemetryFromBridge(primaryIp, 2222)) {
+            gotTelemetry = true;
+            bridge_ip = primaryIp.toString();
+            saveConfig(wifi_ssid, wifi_psk, bridge_ip, bridge_port);
         }
 
-        if (success) {
+        if (gotTelemetry) {
             snprintf(dbgStatus, sizeof(dbgStatus), "ONLINE (%d dBm)", tele.rssi);
-            vTaskDelay(pdMS_TO_TICKS(40));
+            vTaskDelay(pdMS_TO_TICKS(35));
         } else {
             tele.connected = false;
             tele.fwd_w  = 0.0f;
@@ -508,20 +585,30 @@ void telemetryTask(void *pvParameters) {
             tele.swr    = 1.0f;
             tele.pa_swr = 1.0f;
             tele.is_tx  = false;
-            if (strncmp(lastFetchErr, "NO_TCP", 6) == 0) {
-                snprintf(dbgStatus, sizeof(dbgStatus), "SWR BRIDGE OFFLINE");
-            } else {
-                snprintf(dbgStatus, sizeof(dbgStatus), "OFFLINE: %s", lastFetchErr);
-            }
-            vTaskDelay(pdMS_TO_TICKS(350));
-        }
+            snprintf(dbgStatus, sizeof(dbgStatus), "SWR BRIDGE OFFLINE");
 
-        static unsigned long lastDbgPrint = 0;
-        if (millis() - lastDbgPrint > 1000) {
-            lastDbgPrint = millis();
-            Serial.printf("[TELE] dbg='%s' conn=%d fwd=%.1f swr=%.2f b_ip=%s:%u localIP=%s ssid='%s'\n",
-                          dbgStatus, (int)tele.connected, tele.fwd_w, tele.swr, bridge_ip.c_str(), bridge_port,
-                          WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
+            // Bridge not responding on home LAN: check if SWR-Meter-AP has appeared!
+            if (millis() - lastBridgeScan >= 2500) {
+                lastBridgeScan = millis();
+                int n = WiFi.scanNetworks();
+                bool found = false;
+                for (int i = 0; i < n; i++) {
+                    if (WiFi.SSID(i) == "SWR-Meter-AP") {
+                        found = true;
+                        break;
+                    }
+                }
+                WiFi.scanDelete();
+
+                if (found) {
+                    Serial.println("[ROAM] SWR-Meter-AP detected! Connecting directly to bridge...");
+                    WiFi.disconnect();
+                    WiFi.begin("SWR-Meter-AP", "12345678");
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(300));
         }
     }
 }
@@ -1097,7 +1184,7 @@ String getIndexHtml() {
     if (WiFi.status() == WL_CONNECTED) {
         wifiStatus = "<span class='val-online'>Yhdistetty (" + WiFi.SSID() + ", " + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)</span>";
     } else if (apModeActive) {
-        wifiStatus = "<span class='val-offline'>Setup AP aktiivinen (192.168.4.1)</span>";
+        wifiStatus = "<span class='val-offline'>Setup AP aktiivinen (192.168.99.1)</span>";
     } else {
         wifiStatus = "<span class='val-offline'>Yhdistet&auml;&auml;n...</span>";
     }
@@ -1117,9 +1204,9 @@ String getIndexHtml() {
 bool captivePortal() {
     if (!apModeActive) return false;
     String host = otaServer.hostHeader();
-    if (host.indexOf("192.168.4.1") < 0) {
-        Serial.printf("[CAPTIVE] Redirecting host '%s' to http://192.168.4.1/\n", host.c_str());
-        otaServer.sendHeader("Location", "http://192.168.4.1/", true);
+    if (host.indexOf("192.168.99.1") < 0) {
+        Serial.printf("[CAPTIVE] Redirecting host '%s' to http://192.168.99.1/\n", host.c_str());
+        otaServer.sendHeader("Location", "http://192.168.99.1/", true);
         otaServer.send(302, "text/plain", "");
         return true;
     }
@@ -1252,41 +1339,60 @@ void setupWebServerRoutes() {
     Serial.println("[HTTP] WebServer routes registered.");
 }
 
+void stopSetupAP() {
+    if (!apModeActive) return;
+    Serial.println("[AP] Stopping Setup AP...");
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    apModeActive = false;
+    Serial.println("[AP] Setup AP stopped, returned to STA mode.");
+}
+
 void startSetupAP() {
     if (apModeActive) return;
     Serial.println("[AP] Starting open Setup AP: SWR-Display-Setup...");
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+    // Use 192.168.99.1 to NEVER clash with bridge 192.168.4.1 or LAN 192.168.1.x!
+    WiFi.softAPConfig(IPAddress(192, 168, 99, 1), IPAddress(192, 168, 99, 1), IPAddress(255, 255, 255, 0));
     WiFi.softAP("SWR-Display-Setup"); // Open network, no password!
     delay(100);
-    dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+    dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 99, 1));
     setupWebServerRoutes();
     otaServer.begin();
     apModeActive = true;
-    Serial.println("[AP] Setup AP running at 192.168.4.1 (DNS port 53 active)");
+    Serial.println("[AP] Setup AP running at 192.168.99.1 (DNS port 53 active)");
 }
 
 // =========================================================================
 // OTA & MDNS INITIALIZATION (CALLED ONCE WIFI STA IS CONNECTED)
 // =========================================================================
 static bool otaStarted = false;
+static IPAddress lastOtaIp;
 
 void initOTAOnceConnected() {
     if (WiFi.status() != WL_CONNECTED) return;
-    if (otaStarted) return; // Prevent restarting WebServer repeatedly in loop!
+    IPAddress currentIp = WiFi.localIP();
+    if (otaStarted && currentIp == lastOtaIp) return;
 
     setupWebServerRoutes();
-    otaServer.begin();
+    if (!otaStarted) {
+        otaServer.begin();
+    }
 
+    MDNS.end();
     if (MDNS.begin("swrdisplay")) {
         MDNS.addService("http", "tcp", 80);
         MDNS.addService("arduino", "tcp", 3232);
-        Serial.printf("[OTA] mDNS active: http://swrdisplay.local (IP: %s)\n", WiFi.localIP().toString().c_str());
+        Serial.printf("[OTA] mDNS active: http://swrdisplay.local (IP: %s)\n", currentIp.toString().c_str());
     }
-    ArduinoOTA.setHostname("swrdisplay");
-    ArduinoOTA.begin();
-    otaStarted = true;
-    Serial.println("[OTA] ArduinoOTA and WebServer started successfully!");
+    if (!otaStarted) {
+        ArduinoOTA.setHostname("swrdisplay");
+        ArduinoOTA.begin();
+        otaStarted = true;
+    }
+    lastOtaIp = currentIp;
+    Serial.printf("[OTA] WebServer & OTA ready on IP: %s\n", currentIp.toString().c_str());
 }
 
 // =========================================================================
@@ -1361,7 +1467,7 @@ void setup() {
     WiFi.begin(connectSsid.c_str(), connectPass.c_str());
 
     int retries = 0;
-    while (WiFi.status() != WL_CONNECTED && retries < 25) {
+    while (WiFi.status() != WL_CONNECTED && retries < 30) {
         delay(200);
         retries++;
     }
@@ -1372,8 +1478,7 @@ void setup() {
         esp_wifi_set_ps(WIFI_PS_NONE);
         WiFi.setSleep(false);
     } else {
-        Serial.println("[WIFI] Connection failed, starting Setup AP...");
-        startSetupAP();
+        Serial.println("[WIFI] Initial connect pending, telemetryTask will continue in background...");
     }
 
     // 5. Start Background Telemetry Task on Core 0
@@ -1418,20 +1523,43 @@ void loop() {
         lastActivityTime = now;
     }
 
-    // 3. Process Touch Input (Wake screen or cycle themes)
+    // 3. Process Touch Input (Wake screen, cycle themes, or long press for Setup AP)
     tp.read();
-    if (tp.isTouched && (now - lastTouchTime > 350)) {
-        lastTouchTime = now;
-        lastActivityTime = now;
+    static unsigned long touchStartTime = 0;
+    static bool touchHandled = false;
 
+    if (tp.isTouched) {
+        lastActivityTime = now;
         if (!isBacklightOn) {
-            // First tap wakes up the screen
             digitalWrite(GFX_BL, HIGH);
             isBacklightOn = true;
             Serial.println("[STANDBY] Screen tapped -> Screen woke up!");
+            touchHandled = true;
         } else {
-            // Screen is awake -> cycle through themes
-            currentTheme = (DisplayTheme)((currentTheme + 1) % THEME_COUNT);
+            if (touchStartTime == 0) {
+                touchStartTime = now;
+                touchHandled = false;
+            } else if (!touchHandled && (now - touchStartTime >= 4000)) {
+                // Long press 4 seconds -> Toggle Setup AP
+                touchHandled = true;
+                if (apModeActive) {
+                    stopSetupAP();
+                    Serial.println("[TOUCH] Setup AP stopped by user long press.");
+                } else {
+                    startSetupAP();
+                    Serial.println("[TOUCH] Setup AP started by user long press.");
+                }
+            }
+        }
+    } else {
+        if (touchStartTime > 0) {
+            unsigned long duration = now - touchStartTime;
+            if (!touchHandled && duration >= 50 && duration < 1500) {
+                // Short tap -> cycle themes
+                currentTheme = (DisplayTheme)((currentTheme + 1) % THEME_COUNT);
+            }
+            touchStartTime = 0;
+            touchHandled = false;
         }
     }
 
